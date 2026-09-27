@@ -3,25 +3,40 @@
 //
 // Serial commands:
 //   help
-//   mode pwm                              -> global PWM mode (B_EN=0)
-//   mode abm                              -> global Auto Breath mode (B_EN=1)
-//   load pwm BBGGRR BBGGRR ...             -> one 6-hex-digit BBGGRR token per physical RGB
+//   panel [<n 1-3>]                       -> number of panels incl. the master (default 1).
+//                                             Panels stack in Y: 8x4, 8x8 or 8x12 RGB LEDs.
+//                                             Changing it resets all panels and sets SYNC
+//                                             (master=01, slaves=10) when n > 1
+//   mode pwm                              -> global PWM mode (B_EN=0), all panels
+//   mode abm                              -> global Auto Breath mode (B_EN=1), all panels
+//   load pwm RRGGBB RRGGBB ...             -> one 6-hex-digit RRGGBB token per physical RGB
 //                                             LED (dot), starting at LED 0, e.g.
 //                                             load pwm 0a0b30 0a0b3f Fa7bC3
 //                                             (non-zero channel also turns that dot's On/Off bit on)
-//   load abm m0,m1,m2, ...                 -> flat list of ABM modes (0-3), assigned to dots
-//                                             starting at dot 0, in order
+//   load abm mR mG mB mR mG mB ...         -> one ABM mode (0-3) per colour channel: R,G,B of
+//                                             LED 0, then R,G,B of LED 1, ... (LEDs X first).
+//                                             ABM dots breathe up to their PWM value, so
+//                                             'load pwm' them first
+//   fill pwm from <s> to <e> with RRGGBB ...  -> repeat the RRGGBB pattern over RGB LEDs s..e
+//                                             (X first, across panels), truncated at e
+//   fill abm from <s> to <e> with m m ...  -> repeat the mode pattern over the R,G,B channels
+//                                             of RGB LEDs s..e, truncated at e's B channel
 //   assign abm <n> <dot...>               -> same assignment, but by explicit dot index
-//                                             (n = 0 for PWM control, 1-3 for ABM-1..3)
-//   define abm <n> <T1> <T2> <T3> <T4>    -> program ABM-n timing (raw register codes, not
-//                                             seconds - see Table 15/16 of the datasheet) and
-//                                             commit per Figure 16 (clear/set B_EN, update 0Eh)
-//   gcc <0-255>                           -> Global Current Control (PG3, 01h)
+//                                             (panel*96 + chip dot; n = 0 for PWM control,
+//                                             1-3 for ABM-1..3)
+//   define abm <n> <T1> <T2> <T3> <T4> [start <1-4>] [end on|off] [loop <0-4095>]
+//                                         -> program ABM-n timing on all panels (raw register
+//                                             codes, not seconds - see Table 15/16 of the
+//                                             datasheet) and commit per Figure 16. Optional,
+//                                             any order: 'start' sets LB, the phase the loop
+//                                             begins at (default T1); 'end' sets LE, finish
+//                                             on (end of T1) or off (end of T3, default);
+//                                             'loop' sets LTA:LTB, the repeat count (0 = endless)
+//   gcc <0-255>                           -> Global Current Control (PG3, 01h), all panels
 //   reset                                 -> trigger IC reset (read PG3, 11h) and re-init
 //   dump                                  -> print current shadow state
 //
-// I2C address assumes ADDR1 = ADDR2 = GND (7-bit address 0x50). Change I2C_ADDR below
-// if ADDR1/ADDR2 are strapped differently (see Table 1 in the datasheet).
+// I2C addresses per panel are in PANEL_ADDR below (see Table 1 in the datasheet).
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -30,7 +45,14 @@
 // Chip constants
 // ---------------------------------------------------------------------------
 
-static const uint8_t I2C_ADDR = 0x50; // ADDR1=ADDR2=GND -> A4:A3=00, A2:A1=00
+// Panel 0 is the SYNC master; the others are SYNC slaves and sit below it in Y.
+// 7-bit addresses for Wire (8-bit write addresses 0xA0/0xA2/0xA4 >> 1).
+static const uint8_t MAX_PANELS = 3;
+static const uint8_t PANEL_ADDR[MAX_PANELS] = {
+  0x50, // master:  ADDR2=GND, ADDR1=GND -> A4:A3=00, A2:A1=00
+  0x51, // slave 1: ADDR2=GND, ADDR1=SCL -> A4:A3=00, A2:A1=01
+  0x52, // slave 2: ADDR2=GND, ADDR1=SDA -> A4:A3=00, A2:A1=10
+};
 
 // Top-level registers (not behind a page select)
 static const uint8_t REG_CMD        = 0xFD; // Command register (page select), write-only
@@ -60,45 +82,62 @@ static const uint8_t FN_RESET     = 0x11;
 static const uint8_t CFG_SSD_BIT  = 0x01; // 0=shutdown, 1=normal operation
 static const uint8_t CFG_BEN_BIT  = 0x02; // 0=PWM mode, 1=Auto Breath mode
 static const uint8_t CFG_OSD_BIT  = 0x04; // open/short detect trigger
-static const uint8_t CFG_SYNC_MASK = 0xC0;
+static const uint8_t CFG_SYNC_MASK   = 0xC0;
+static const uint8_t CFG_SYNC_MASTER = 0x40; // SYNC=01, SYNC pin outputs the clock
+static const uint8_t CFG_SYNC_SLAVE  = 0x80; // SYNC=10, SYNC pin takes the clock
 
 static const uint8_t NUM_SW = 12;
 static const uint8_t NUM_CS = 8;
-static const uint8_t NUM_DOTS = NUM_SW * NUM_CS; // 96
+static const uint8_t NUM_DOTS = NUM_SW * NUM_CS; // 96 per chip
+static const uint8_t LEDS_PER_PANEL = (NUM_SW / 3) * NUM_CS; // 32 RGB LEDs per chip
 
 // ---------------------------------------------------------------------------
 // Shadow state (registers on this chip are write-only, so we track them here)
 // ---------------------------------------------------------------------------
 
-static uint8_t g_config = 0x00;
-static uint8_t g_gcc    = 0x00;
-static uint8_t g_pwm[NUM_DOTS];      // last PWM value written per dot
-static uint8_t g_onoff[24];          // LED On/Off Register shadow, 00h~17h
-static uint8_t g_abmAssign[NUM_DOTS]; // per-dot ABM selection shadow (0..3)
+static uint8_t g_numPanels = 1;
+static uint8_t g_addr = PANEL_ADDR[0];                 // chip the I2C helpers talk to
+static uint8_t g_config[MAX_PANELS];
+static uint8_t g_gcc = 0x00;                           // same on every panel
+static uint8_t g_pwm[MAX_PANELS][NUM_DOTS];            // last PWM value written per dot
+static uint8_t g_onoff[MAX_PANELS][24];                // LED On/Off Register shadow, 00h~17h
+static uint8_t g_abmAssign[MAX_PANELS][NUM_DOTS];      // per-dot ABM selection shadow (0..3)
+
+static uint8_t numLeds() { return (uint8_t)(g_numPanels * LEDS_PER_PANEL); }
+static uint16_t numDots() { return (uint16_t)(g_numPanels * NUM_DOTS); }
 
 // ---------------------------------------------------------------------------
-// Low-level I2C helpers
+// Low-level I2C helpers (all talk to g_addr, set via selectChip)
 // ---------------------------------------------------------------------------
+
+static void selectChip(uint8_t panel) {
+  g_addr = PANEL_ADDR[panel];
+}
+
+static bool chipPresent(uint8_t panel) {
+  Wire.beginTransmission(PANEL_ADDR[panel]);
+  return Wire.endTransmission() == 0;
+}
 
 static bool i2cWriteReg(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(I2C_ADDR);
+  Wire.beginTransmission(g_addr);
   Wire.write(reg);
   Wire.write(value);
   return Wire.endTransmission() == 0;
 }
 
 static bool i2cWriteBlock(uint8_t startReg, const uint8_t *data, size_t len) {
-  Wire.beginTransmission(I2C_ADDR);
+  Wire.beginTransmission(g_addr);
   Wire.write(startReg);
   for (size_t i = 0; i < len; i++) Wire.write(data[i]);
   return Wire.endTransmission() == 0;
 }
 
 static int i2cReadReg(uint8_t reg) {
-  Wire.beginTransmission(I2C_ADDR);
+  Wire.beginTransmission(g_addr);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return -1; // repeated start, keep bus
-  if (Wire.requestFrom(I2C_ADDR, (uint8_t)1) != 1) return -1;
+  if (Wire.requestFrom(g_addr, (uint8_t)1) != 1) return -1;
   if (!Wire.available()) return -1;
   return Wire.read();
 }
@@ -145,58 +184,114 @@ static void dotToSwCs(uint8_t dot, uint8_t &sw, uint8_t &cs) {
   cs = (uint8_t)(dot % NUM_CS + 1);
 }
 
-// Write one dot's PWM value and keep its On/Off bit in sync (on if value>0).
-static void setDotPwm(uint8_t dot, uint8_t value) {
-  if (dot >= NUM_DOTS) return;
-  uint8_t sw, cs;
+// A global dot index is panel * 96 + the chip's own dot index.
+static void splitDot(uint16_t gdot, uint8_t &panel, uint8_t &dot) {
+  panel = (uint8_t)(gdot / NUM_DOTS);
+  dot = (uint8_t)(gdot % NUM_DOTS);
+}
+
+// Physical RGB LED layout: each panel is 8 LEDs in X (CS1..CS8) x 4 LEDs in Y
+// (SW row groups of 3), panels stacked in Y. LEDs are numbered X first: LED n
+// is at x = n%8, y = n/8, on panel y/4. Its channels on CS(x+1) are wired
+// B=SW(y'*3+1), G=SW(y'*3+2), R=SW(y'*3+3) (y' = y%4), i.e. the panel has R and
+// B in reverse SW order - this is the one place that swap lives.
+static uint16_t rgbDot(uint8_t led, uint8_t channel /*0=R,1=G,2=B*/) {
+  uint8_t panel = (uint8_t)(led / LEDS_PER_PANEL);
+  uint8_t local = (uint8_t)(led % LEDS_PER_PANEL);
+  uint8_t x = (uint8_t)(local % NUM_CS);
+  uint8_t y = (uint8_t)(local / NUM_CS);
+  return (uint16_t)(panel * NUM_DOTS + (y * 3 + (2 - channel)) * NUM_CS + x);
+}
+
+// A dot must be on if it has a PWM value or is running an ABM pattern.
+static void syncDotOnOff(uint8_t panel, uint8_t dot) {
+  uint8_t sw, cs, addr, bitPos;
+  dotToSwCs(dot, sw, cs);
+  onoffAddrForDot(sw, cs, addr, bitPos);
+  if (g_pwm[panel][dot] > 0 || g_abmAssign[panel][dot] != 0)
+    g_onoff[panel][addr] |= (uint8_t)(1 << bitPos);
+  else
+    g_onoff[panel][addr] &= (uint8_t)~(1 << bitPos);
+}
+
+// Write one dot's PWM value and keep its On/Off bit in sync.
+static void setDotPwm(uint16_t gdot, uint8_t value) {
+  if (gdot >= numDots()) return;
+  uint8_t panel, dot, sw, cs;
+  splitDot(gdot, panel, dot);
   dotToSwCs(dot, sw, cs);
 
-  g_pwm[dot] = value;
+  g_pwm[panel][dot] = value;
+  selectChip(panel);
   writePageReg(PAGE_PWM, pwmAddrForDot(sw, cs), value);
-
-  uint8_t addr, bitPos;
-  onoffAddrForDot(sw, cs, addr, bitPos);
-  if (value > 0) g_onoff[addr] |= (uint8_t)(1 << bitPos);
-  else           g_onoff[addr] &= (uint8_t)~(1 << bitPos);
+  syncDotOnOff(panel, dot);
 }
 
-// Push the whole On/Off shadow (00h~17h, 24 bytes) out in one block write.
+// Push each active panel's On/Off shadow (00h~17h, 24 bytes) out in one block write.
 static void flushOnOff() {
-  writePageBlock(PAGE_LEDCTRL, 0x00, g_onoff, sizeof(g_onoff));
+  for (uint8_t p = 0; p < g_numPanels; p++) {
+    selectChip(p);
+    writePageBlock(PAGE_LEDCTRL, 0x00, g_onoff[p], sizeof(g_onoff[p]));
+  }
 }
 
-static void writeConfig(uint8_t value) {
-  g_config = value;
-  writePageReg(PAGE_FUNC, FN_CONFIG, value);
+static void writeConfig(uint8_t panel) {
+  selectChip(panel);
+  writePageReg(PAGE_FUNC, FN_CONFIG, g_config[panel]);
 }
 
+// Set or clear a config bit on every active panel.
 static void updateConfigBit(uint8_t mask, bool set) {
-  if (set) g_config |= mask;
-  else     g_config &= (uint8_t)~mask;
-  writeConfig(g_config);
+  for (uint8_t p = 0; p < g_numPanels; p++) {
+    if (set) g_config[p] |= mask;
+    else     g_config[p] &= (uint8_t)~mask;
+    writeConfig(p);
+  }
+}
+
+// Write the same Function Register value to every active panel.
+static void writeFuncAll(uint8_t reg, uint8_t value) {
+  for (uint8_t p = 0; p < g_numPanels; p++) {
+    selectChip(p);
+    writePageReg(PAGE_FUNC, reg, value);
+  }
 }
 
 // ---------------------------------------------------------------------------
 // High level operations
 // ---------------------------------------------------------------------------
 
-static void chipReset() {
-  selectPage(PAGE_FUNC);
-  i2cReadReg(FN_RESET); // reading this register resets all registers to POR state
+static uint8_t syncBitsFor(uint8_t panel) {
+  if (g_numPanels == 1) return 0x00; // SYNC pin high impedance
+  return panel == 0 ? CFG_SYNC_MASTER : CFG_SYNC_SLAVE;
+}
 
-  g_config = 0x00;
+// Resets every possible panel (so a panel dropped by 'panel <n>' is blanked -
+// POR leaves it in software shutdown), then brings the active ones up with
+// their SYNC role. Slaves are configured before the master so they are all
+// waiting for its clock when it starts.
+static void chipReset() {
+  for (uint8_t p = 0; p < MAX_PANELS; p++) {
+    selectChip(p);
+    selectPage(PAGE_FUNC);
+    i2cReadReg(FN_RESET); // reading this register resets all registers to POR state
+  }
+
   g_gcc = 0x00;
   memset(g_pwm, 0, sizeof(g_pwm));
   memset(g_onoff, 0, sizeof(g_onoff));
   memset(g_abmAssign, 0, sizeof(g_abmAssign));
 
-  // Bring the chip out of software shutdown so it actually drives the matrix.
-  updateConfigBit(CFG_SSD_BIT, true);
+  for (int8_t p = (int8_t)(g_numPanels - 1); p >= 0; p--) {
+    // SSD=1 brings the chip out of software shutdown so it drives the matrix.
+    g_config[p] = (uint8_t)(syncBitsFor((uint8_t)p) | CFG_SSD_BIT);
+    writeConfig((uint8_t)p);
+  }
 }
 
 static void setGcc(uint8_t value) {
   g_gcc = value;
-  writePageReg(PAGE_FUNC, FN_GCC, value);
+  writeFuncAll(FN_GCC, value);
 }
 
 static void setGlobalMode(bool abm) {
@@ -205,42 +300,81 @@ static void setGlobalMode(bool abm) {
 
 // Assign a dot's per-dot Auto Breath Mode selection register (00=PWM control,
 // 01/10/11 = ABM-1/2/3). Required for a dot to actually run any ABM timing.
-static void assignDotAbm(uint8_t dot, uint8_t mode /*0-3*/) {
-  if (dot >= NUM_DOTS || mode > 3) return;
-  uint8_t sw, cs;
+// Also updates the On/Off shadow - caller must flushOnOff() afterwards.
+// Note: in ABM the dot breathes up to its PWM register value, so PWM must be >0.
+static void assignDotAbm(uint16_t gdot, uint8_t mode /*0-3*/) {
+  if (gdot >= numDots() || mode > 3) return;
+  uint8_t panel, dot, sw, cs;
+  splitDot(gdot, panel, dot);
   dotToSwCs(dot, sw, cs);
-  g_abmAssign[dot] = mode;
+  g_abmAssign[panel][dot] = mode;
+  selectChip(panel);
   writePageReg(PAGE_ABM, abmAddrForDot(sw, cs), mode & 0x03);
+  syncDotOnOff(panel, dot);
 }
 
-// Program one ABM slot's timing and commit it per the datasheet's Figure 16
-// flow: write 02h~0Dh -> clear B_EN -> set B_EN -> write 0Eh=0x00.
-static void defineAbm(uint8_t n /*1-3*/, uint8_t T1, uint8_t T2, uint8_t T3, uint8_t T4) {
-  if (n < 1 || n > 3) return;
+// Count dots assigned to an ABM slot whose PWM (= breath peak) is still 0.
+static uint16_t countDarkAbmDots() {
+  uint16_t n = 0;
+  for (uint8_t p = 0; p < g_numPanels; p++) {
+    for (uint8_t d = 0; d < NUM_DOTS; d++) {
+      if (g_abmAssign[p][d] != 0 && g_pwm[p][d] == 0) n++;
+    }
+  }
+  return n;
+}
+
+static void warnDarkAbmDots() {
+  uint16_t n = countDarkAbmDots();
+  if (n == 0) return;
+  Serial.print(F("warning: "));
+  Serial.print(n);
+  Serial.println(F(" ABM dot(s) have PWM=0 - ABM breathes up to the PWM value, use 'load pwm' to set it"));
+}
+
+// Program one ABM slot's timing on every panel and commit it per the
+// datasheet's Figure 16 flow: write 02h~0Dh -> clear B_EN -> set B_EN ->
+// write 0Eh=0x00. Each step is done on all panels before the next, so the
+// panels start their breath cycle as close together as the bus allows.
+static const uint16_t MAX_ABM_LOOPS = 4095; // 12-bit LTA:LTB
+
+// Loop characters (Table 17/18):
+//   startT (1-4) -> LB = startT-1, the phase the loop begins at
+//   endOn        -> LE = 01 (end at on state, end of T1) else 00 (end at off, end of T3)
+//   loops        -> LTA:LTB = loop count, 0 = endless
+static void defineAbm(uint8_t n /*1-3*/, uint8_t T1, uint8_t T2, uint8_t T3, uint8_t T4,
+                      uint8_t startT /*1-4*/, bool endOn, uint16_t loops) {
+  if (n < 1 || n > 3 || startT < 1 || startT > 4 || loops > MAX_ABM_LOOPS) return;
   uint8_t base = (n == 1) ? FN_ABM1_BASE : (n == 2) ? FN_ABM2_BASE : FN_ABM3_BASE;
 
   uint8_t regs[4];
   regs[0] = (uint8_t)(((T1 & 0x07) << 5) | ((T2 & 0x0F) << 1)); // fade-in / hold
   regs[1] = (uint8_t)(((T3 & 0x07) << 5) | ((T4 & 0x0F) << 1)); // fade-out / off
-  regs[2] = 0x00; // LE=00 (end at off), LB=00 (begin at T1), LTA=0000 (endless loop)
-  regs[3] = 0x00; // LTB=0 -> combined with LTA=0 this means endless loop
+  regs[2] = (uint8_t)(((endOn ? 1 : 0) << 6) |          // LE
+                      (((startT - 1) & 0x03) << 4) |    // LB
+                      ((loops >> 8) & 0x0F));           // LTA, loop count bits 8-11
+  regs[3] = (uint8_t)(loops & 0xFF);                    // LTB, loop count bits 0-7
 
-  writePageBlock(PAGE_FUNC, base, regs, sizeof(regs));
+  for (uint8_t p = 0; p < g_numPanels; p++) {
+    selectChip(p);
+    writePageBlock(PAGE_FUNC, base, regs, sizeof(regs));
+  }
 
   updateConfigBit(CFG_BEN_BIT, false); // clear B_EN
   updateConfigBit(CFG_BEN_BIT, true);  // set B_EN
-  writePageReg(PAGE_FUNC, FN_TIME_UPD, 0x00); // commit 02h~0Dh
+  writeFuncAll(FN_TIME_UPD, 0x00);     // commit 02h~0Dh
 }
 
 // ---------------------------------------------------------------------------
 // Command parsing helpers
 // ---------------------------------------------------------------------------
 
-static const uint8_t MAX_TOKENS = 100;
+// Enough for a full 'load abm' on 3 panels (96 LEDs x 3 channels + 2).
+static const uint16_t MAX_TOKENS = 300;
 
 // Split on space, tab and comma. Empty tokens are skipped.
-static uint8_t tokenize(char *line, char *tokens[], uint8_t maxTokens) {
-  uint8_t count = 0;
+static uint16_t tokenize(char *line, char *tokens[], uint16_t maxTokens) {
+  uint16_t count = 0;
   char *p = strtok(line, " \t,");
   while (p != nullptr && count < maxTokens) {
     tokens[count++] = p;
@@ -257,15 +391,23 @@ static bool parseByte(const char *s, uint8_t &out) {
   return true;
 }
 
-// Parses a 6-hex-digit BBGGRR token, e.g. "0a0b30" or "Fa7bC3".
+static bool parseU16(const char *s, uint16_t &out) {
+  char *end;
+  long v = strtol(s, &end, 10);
+  if (end == s || v < 0 || v > 65535) return false;
+  out = (uint16_t)v;
+  return true;
+}
+
+// Parses a 6-hex-digit RRGGBB token, e.g. "0a0b30" or "Fa7bC3".
 static bool parseHexTriplet(const char *s, uint8_t &r, uint8_t &g, uint8_t &b) {
   if (strlen(s) != 6) return false;
   char *end;
   long value = strtol(s, &end, 16);
   if (end != s + 6 || value < 0) return false;
-  b = (uint8_t)((value >> 16) & 0xFF);
+  r = (uint8_t)((value >> 16) & 0xFF);
   g = (uint8_t)((value >> 8) & 0xFF);
-  r = (uint8_t)(value & 0xFF);
+  b = (uint8_t)(value & 0xFF);
   return true;
 }
 
@@ -276,18 +418,58 @@ static bool parseHexTriplet(const char *s, uint8_t &r, uint8_t &g, uint8_t &b) {
 static void printHelp() {
   Serial.println(F("Commands:"));
   Serial.println(F("  help"));
+  Serial.println(F("  panel [<n 1-3>]                    (panels incl. master, stacked in Y; resets all)"));
   Serial.println(F("  mode pwm"));
   Serial.println(F("  mode abm"));
-  Serial.println(F("  load pwm BBGGRR BBGGRR ...         (one hex triplet per LED, LED 0 upward)"));
-  Serial.println(F("  load abm m0,m1,m2, ...             (dot 0 upward, 0=PWM control, 1-3=ABM-1..3)"));
-  Serial.println(F("  assign abm <n 0-3> <dot...>        (same, but by explicit dot index)"));
-  Serial.println(F("  define abm <n 1-3> <T1> <T2> <T3> <T4>   (raw codes, see datasheet Table 15/16)"));
+  Serial.println(F("  load pwm RRGGBB RRGGBB ...         (one hex triplet per LED, LED 0 upward)"));
+  Serial.println(F("  load abm mR mG mB mR mG mB ...     (one mode per R,G,B channel, LED 0 upward, 0=PWM, 1-3=ABM-1..3)"));
+  Serial.println(F("  fill pwm from <led> to <led> with RRGGBB ...   (pattern repeats, truncated at end)"));
+  Serial.println(F("  fill abm from <led> to <led> with m m m ...    (one mode per R,G,B channel, repeats)"));
+  Serial.println(F("  assign abm <n 0-3> <dot...>        (same, but by explicit dot index, panel*96 + dot)"));
+  Serial.println(F("  define abm <n 1-3> <T1> <T2> <T3> <T4> [start <1-4>] [end on|off] [loop <0-4095>]"));
+  Serial.println(F("                                     (T codes: datasheet Table 15/16; start = begin at T1..T4,"));
+  Serial.println(F("                                      default T1; end = finish on or off, default off;"));
+  Serial.println(F("                                      loop = repeat count, default 0 = endless)"));
   Serial.println(F("  gcc <0-255>"));
   Serial.println(F("  reset"));
   Serial.println(F("  dump"));
 }
 
-static void cmdMode(uint8_t argc, char *argv[]) {
+static void printPanelSize() {
+  Serial.print(g_numPanels);
+  Serial.print(F(" panel(s), 8x"));
+  Serial.print(g_numPanels * 4);
+  Serial.print(F(" RGB LEDs (0-"));
+  Serial.print(numLeds() - 1);
+  Serial.println(')');
+}
+
+static void cmdPanel(uint16_t argc, char *argv[]) {
+  if (argc < 2) {
+    printPanelSize();
+    return;
+  }
+  uint8_t n;
+  if (!parseByte(argv[1], n) || n < 1 || n > MAX_PANELS) {
+    Serial.println(F("usage: panel <1-3>"));
+    return;
+  }
+  g_numPanels = n;
+  chipReset();
+  Serial.print(F("OK "));
+  printPanelSize();
+  Serial.println(F("all panels reset"));
+  for (uint8_t p = 0; p < g_numPanels; p++) {
+    if (!chipPresent(p)) {
+      Serial.print(F("warning: panel "));
+      Serial.print(p);
+      Serial.print(F(" not answering at 0x"));
+      Serial.println(PANEL_ADDR[p], HEX);
+    }
+  }
+}
+
+static void cmdMode(uint16_t argc, char *argv[]) {
   if (argc < 2) { Serial.println(F("usage: mode pwm|abm")); return; }
   if (strcmp(argv[1], "pwm") == 0) {
     setGlobalMode(false);
@@ -302,26 +484,23 @@ static void cmdMode(uint8_t argc, char *argv[]) {
 
 // Each token is one RGB LED as a 6-hex-digit RRGGBB value, e.g.
 //   load pwm 0a0b30 0a0b3f Fa7bC3
-// LED n: R=SW(n%4*3+1)/CS(n/4+1), G=next SW row, B=next SW row after that.
-static void cmdLoadPwm(uint8_t argc, char *argv[]) {
-  static const uint8_t NUM_LEDS = (NUM_SW / 3) * NUM_CS; // 32
+// LEDs are filled X first (see rgbDot).
+static void cmdLoadPwm(uint16_t argc, char *argv[]) {
   uint8_t led = 0;
-  for (uint8_t i = 2; i < argc; i++, led++) {
-    if (led >= NUM_LEDS) {
+  for (uint16_t i = 2; i < argc; i++, led++) {
+    if (led >= numLeds()) {
       Serial.println(F("ran out of dots, stopping"));
       break;
     }
     uint8_t r, g, b;
     if (!parseHexTriplet(argv[i], r, g, b)) {
-      Serial.print(F("bad BBGGRR value: "));
+      Serial.print(F("bad RRGGBB value: "));
       Serial.println(argv[i]);
       return;
     }
-    uint8_t cs  = (uint8_t)(led / 4 + 1);
-    uint8_t swR = (uint8_t)((led % 4) * 3 + 1);
-    setDotPwm((uint8_t)((swR - 1) * NUM_CS + (cs - 1)), r);
-    setDotPwm((uint8_t)((swR    ) * NUM_CS + (cs - 1)), g);
-    setDotPwm((uint8_t)((swR + 1) * NUM_CS + (cs - 1)), b);
+    setDotPwm(rgbDot(led, 0), r);
+    setDotPwm(rgbDot(led, 1), g);
+    setDotPwm(rgbDot(led, 2), b);
   }
   flushOnOff();
   Serial.print(F("OK loaded "));
@@ -329,28 +508,36 @@ static void cmdLoadPwm(uint8_t argc, char *argv[]) {
   Serial.println(F(" LED(s)"));
 }
 
-// Assign ABM mode per dot in sequence, starting at dot 0 - e.g.
-//   load abm 1, 1, 1, 2, 2, 0, 0, ...
-// gives dot 0-2 ABM-1, dots 3-4 ABM-2, dots 5-6 back to PWM control, etc.
-static void cmdLoadAbm(uint8_t argc, char *argv[]) {
-  uint8_t dot = 0;
-  for (uint8_t i = 2; i < argc && dot < NUM_DOTS; i++, dot++) {
+// Assign one ABM mode per colour channel, R,G,B of LED 0, then R,G,B of LED 1,
+// and so on, LEDs filled X first (see rgbDot) - e.g.
+//   load abm 1 2 3 3 2 1
+// gives LED (0,0) R=ABM-1 G=ABM-2 B=ABM-3 and LED (1,0) R=ABM-3 G=ABM-2 B=ABM-1.
+// 0 puts a channel back under plain PWM control.
+static void cmdLoadAbm(uint16_t argc, char *argv[]) {
+  uint16_t n = 0; // channel index: led = n/3, channel = n%3
+  for (uint16_t i = 2; i < argc; i++, n++) {
+    if (n >= (uint16_t)numLeds() * 3) {
+      Serial.println(F("ran out of dots, stopping"));
+      break;
+    }
     uint8_t mode;
     if (!parseByte(argv[i], mode) || mode > 3) {
       Serial.print(F("bad mode (0-3): "));
       Serial.println(argv[i]);
-      return;
+      break; // still flush what was assigned so far
     }
-    assignDotAbm(dot, mode);
+    assignDotAbm(rgbDot((uint8_t)(n / 3), (uint8_t)(n % 3)), mode);
   }
+  flushOnOff();
   Serial.print(F("OK assigned "));
-  Serial.print(dot);
-  Serial.println(F(" abm dot(s)"));
+  Serial.print(n);
+  Serial.println(F(" abm channel(s)"));
+  warnDarkAbmDots();
 }
 
-static void cmdLoad(uint8_t argc, char *argv[]) {
+static void cmdLoad(uint16_t argc, char *argv[]) {
   if (argc < 2) {
-    Serial.println(F("usage: load pwm BBGGRR...  |  load abm m0,m1,m2,..."));
+    Serial.println(F("usage: load pwm RRGGBB...  |  load abm mR mG mB ..."));
     return;
   }
   if (strcmp(argv[1], "pwm") == 0) {
@@ -358,11 +545,81 @@ static void cmdLoad(uint8_t argc, char *argv[]) {
   } else if (strcmp(argv[1], "abm") == 0) {
     cmdLoadAbm(argc, argv);
   } else {
-    Serial.println(F("usage: load pwm BBGGRR...  |  load abm m0,m1,m2,..."));
+    Serial.println(F("usage: load pwm RRGGBB...  |  load abm mR mG mB ..."));
   }
 }
 
-static void cmdAssign(uint8_t argc, char *argv[]) {
+// fill pwm from <start> to <end> with RRGGBB RRGGBB ...
+// fill abm from <start> to <end> with m m m ...
+// <start>/<end> are RGB LED indices (X first across all panels, see rgbDot),
+// inclusive. The pattern repeats from <start> and is truncated at <end>. For
+// pwm each pattern entry is one whole RGB LED; for abm each entry is one R, G
+// or B channel, taken in R,G,B order across the LEDs in the range.
+static void cmdFill(uint16_t argc, char *argv[]) {
+  static const char USAGE[] =
+      "usage: fill pwm|abm from <led> to <led> with <pattern...>";
+  if (argc < 8 || strcmp(argv[2], "from") != 0 || strcmp(argv[4], "to") != 0 ||
+      strcmp(argv[6], "with") != 0) {
+    Serial.println(USAGE);
+    return;
+  }
+  bool isPwm = strcmp(argv[1], "pwm") == 0;
+  if (!isPwm && strcmp(argv[1], "abm") != 0) {
+    Serial.println(USAGE);
+    return;
+  }
+  uint8_t start, end;
+  if (!parseByte(argv[3], start) || !parseByte(argv[5], end) ||
+      start >= numLeds() || end >= numLeds() || start > end) {
+    Serial.print(F("start/end must be LED 0-"));
+    Serial.print(numLeds() - 1);
+    Serial.println(F(" with start <= end"));
+    return;
+  }
+
+  char **pattern = &argv[7];
+  uint16_t patLen = (uint16_t)(argc - 7);
+
+  // Validate the whole pattern before touching the chip.
+  for (uint16_t p = 0; p < patLen; p++) {
+    uint8_t r, g, b, mode;
+    bool ok = isPwm ? parseHexTriplet(pattern[p], r, g, b)
+                    : (parseByte(pattern[p], mode) && mode <= 3);
+    if (!ok) {
+      Serial.print(isPwm ? F("bad RRGGBB value: ") : F("bad mode (0-3): "));
+      Serial.println(pattern[p]);
+      return;
+    }
+  }
+
+  uint8_t count = (uint8_t)(end - start + 1);
+  if (isPwm) {
+    for (uint8_t i = 0; i < count; i++) {
+      uint8_t r, g, b;
+      parseHexTriplet(pattern[i % patLen], r, g, b);
+      uint8_t led = (uint8_t)(start + i);
+      setDotPwm(rgbDot(led, 0), r);
+      setDotPwm(rgbDot(led, 1), g);
+      setDotPwm(rgbDot(led, 2), b);
+    }
+  } else {
+    uint16_t numChannels = (uint16_t)(count * 3);
+    for (uint16_t i = 0; i < numChannels; i++) {
+      uint8_t mode;
+      parseByte(pattern[i % patLen], mode);
+      assignDotAbm(rgbDot((uint8_t)(start + i / 3), (uint8_t)(i % 3)), mode);
+    }
+  }
+  flushOnOff();
+
+  Serial.print(F("OK filled LED "));
+  Serial.print(start);
+  Serial.print(F(".."));
+  Serial.println(end);
+  if (!isPwm) warnDarkAbmDots();
+}
+
+static void cmdAssign(uint16_t argc, char *argv[]) {
   if (argc < 3 || strcmp(argv[1], "abm") != 0) {
     Serial.println(F("usage: assign abm <n 0-3> <dot...>"));
     return;
@@ -372,36 +629,78 @@ static void cmdAssign(uint8_t argc, char *argv[]) {
     Serial.println(F("mode must be 0-3"));
     return;
   }
-  for (uint8_t i = 3; i < argc; i++) {
-    uint8_t dot;
-    if (!parseByte(argv[i], dot) || dot >= NUM_DOTS) {
+  for (uint16_t i = 3; i < argc; i++) {
+    uint16_t dot;
+    if (!parseU16(argv[i], dot) || dot >= numDots()) {
       Serial.print(F("bad dot index: "));
       Serial.println(argv[i]);
       continue;
     }
     assignDotAbm(dot, mode);
   }
+  flushOnOff();
   Serial.println(F("OK"));
+  warnDarkAbmDots();
 }
 
-static void cmdDefineAbm(uint8_t argc, char *argv[]) {
-  if (argc < 7 || strcmp(argv[1], "abm") != 0) {
-    Serial.println(F("usage: define abm <n 1-3> <T1> <T2> <T3> <T4>"));
+// define abm <n> <T1> <T2> <T3> <T4> [start <1-4>] [end on|off] [loop <0-4095>]
+// The optional keyword pairs may come in any order.
+static void cmdDefineAbm(uint16_t argc, char *argv[]) {
+  static const char USAGE[] =
+      "usage: define abm <n 1-3> <T1> <T2> <T3> <T4> [start <1-4>] [end on|off] [loop <0-4095>]";
+  if (argc < 7 || (argc - 7) % 2 != 0 || strcmp(argv[1], "abm") != 0) {
+    Serial.println(USAGE);
     return;
   }
   uint8_t n, t1, t2, t3, t4;
   if (!parseByte(argv[2], n) || n < 1 || n > 3 ||
       !parseByte(argv[3], t1) || !parseByte(argv[4], t2) ||
       !parseByte(argv[5], t3) || !parseByte(argv[6], t4)) {
-    Serial.println(F("usage: define abm <n 1-3> <T1> <T2> <T3> <T4>"));
+    Serial.println(USAGE);
     return;
   }
-  defineAbm(n, t1, t2, t3, t4);
+
+  uint8_t startT = 1;
+  bool endOn = false;
+  uint16_t loops = 0;
+  for (uint16_t i = 7; i < argc; i += 2) {
+    const char *key = argv[i];
+    const char *val = argv[i + 1];
+    bool ok;
+    if (strcmp(key, "start") == 0) {
+      ok = parseByte(val, startT) && startT >= 1 && startT <= 4;
+    } else if (strcmp(key, "end") == 0) {
+      ok = true;
+      if (strcmp(val, "on") == 0)       endOn = true;
+      else if (strcmp(val, "off") == 0) endOn = false;
+      else                              ok = false;
+    } else if (strcmp(key, "loop") == 0) {
+      ok = parseU16(val, loops) && loops <= MAX_ABM_LOOPS;
+    } else {
+      ok = false;
+    }
+    if (!ok) {
+      Serial.print(F("bad option: "));
+      Serial.print(key);
+      Serial.print(' ');
+      Serial.println(val);
+      Serial.println(USAGE);
+      return;
+    }
+  }
+
+  defineAbm(n, t1, t2, t3, t4, startT, endOn, loops);
   Serial.print(F("OK ABM-"));
-  Serial.println(n);
+  Serial.print(n);
+  Serial.print(F(" start T"));
+  Serial.print(startT);
+  Serial.print(endOn ? F(" end on") : F(" end off"));
+  Serial.print(F(" loop "));
+  if (loops == 0) Serial.println(F("endless"));
+  else            Serial.println(loops);
 }
 
-static void cmdGcc(uint8_t argc, char *argv[]) {
+static void cmdGcc(uint16_t argc, char *argv[]) {
   if (argc < 2) { Serial.println(F("usage: gcc <0-255>")); return; }
   uint8_t value;
   if (!parseByte(argv[1], value)) { Serial.println(F("bad value")); return; }
@@ -411,35 +710,48 @@ static void cmdGcc(uint8_t argc, char *argv[]) {
 }
 
 static void cmdDump() {
-  Serial.print(F("config=0x")); Serial.println(g_config, HEX);
+  printPanelSize();
   Serial.print(F("gcc=")); Serial.println(g_gcc);
+  for (uint8_t p = 0; p < g_numPanels; p++) {
+    Serial.print(F("panel ")); Serial.print(p);
+    Serial.print(F(" @0x")); Serial.print(PANEL_ADDR[p], HEX);
+    Serial.print(F(" config=0x")); Serial.println(g_config[p], HEX);
+  }
   Serial.println(F("pwm (dot:value), non-zero only:"));
-  for (uint8_t d = 0; d < NUM_DOTS; d++) {
-    if (g_pwm[d] != 0) {
-      Serial.print(d); Serial.print(':'); Serial.print(g_pwm[d]); Serial.print(' ');
+  for (uint8_t p = 0; p < g_numPanels; p++) {
+    for (uint8_t d = 0; d < NUM_DOTS; d++) {
+      if (g_pwm[p][d] != 0) {
+        Serial.print(p * NUM_DOTS + d); Serial.print(':'); Serial.print(g_pwm[p][d]); Serial.print(' ');
+      }
     }
   }
   Serial.println();
   Serial.println(F("abm assignment (dot:mode), non-zero only:"));
-  for (uint8_t d = 0; d < NUM_DOTS; d++) {
-    if (g_abmAssign[d] != 0) {
-      Serial.print(d); Serial.print(':'); Serial.print(g_abmAssign[d]); Serial.print(' ');
+  for (uint8_t p = 0; p < g_numPanels; p++) {
+    for (uint8_t d = 0; d < NUM_DOTS; d++) {
+      if (g_abmAssign[p][d] != 0) {
+        Serial.print(p * NUM_DOTS + d); Serial.print(':'); Serial.print(g_abmAssign[p][d]); Serial.print(' ');
+      }
     }
   }
   Serial.println();
 }
 
 static void handleLine(char *line) {
-  char *argv[MAX_TOKENS];
-  uint8_t argc = tokenize(line, argv, MAX_TOKENS);
+  static char *argv[MAX_TOKENS];
+  uint16_t argc = tokenize(line, argv, MAX_TOKENS);
   if (argc == 0) return;
 
   if (strcmp(argv[0], "help") == 0) {
     printHelp();
+  } else if (strcmp(argv[0], "panel") == 0) {
+    cmdPanel(argc, argv);
   } else if (strcmp(argv[0], "mode") == 0) {
     cmdMode(argc, argv);
   } else if (strcmp(argv[0], "load") == 0) {
     cmdLoad(argc, argv);
+  } else if (strcmp(argv[0], "fill") == 0) {
+    cmdFill(argc, argv);
   } else if (strcmp(argv[0], "assign") == 0) {
     cmdAssign(argc, argv);
   } else if (strcmp(argv[0], "define") == 0) {
@@ -461,8 +773,9 @@ static void handleLine(char *line) {
 // Serial line buffering
 // ---------------------------------------------------------------------------
 
-static char g_lineBuf[160];
-static uint8_t g_lineLen = 0;
+// Enough for a full 'load pwm' on 3 panels (96 x "RRGGBB ").
+static char g_lineBuf[1024];
+static uint16_t g_lineLen = 0;
 
 static void pollSerial() {
   while (Serial.available() > 0) {
