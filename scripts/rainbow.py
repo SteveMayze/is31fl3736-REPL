@@ -14,7 +14,9 @@ Each RGB LED wires its R, G, B channels to a rotation of those slots:
 Any three copies of the wave a third of a period apart form a rainbow (one
 primary fades in while the next fades out, the third is off). LED phase p sees
 the colours of LED phase 0 delayed by p*k, so the rainbow travels toward
-increasing phase. Phase = (dx*x + dy*y) mod 3, with x left->right, y bottom->top.
+increasing phase. Phase = (dx*x + dy*y) mod 3, with x left->right, y bottom->top, so
+--direction right/left/up/down (dx,dy = 1,0 / 2,0 / 0,1 / 0,2) picks which way it travels;
+up/down animate by rows, right/left by columns. --dx/--dy override it (step 2 == -1 mod 3).
 
 Only three timing slots exist, so the pattern repeats every 3 LEDs along the
 travel direction.
@@ -34,6 +36,10 @@ WIDTH = 8
 LEDS_PER_PANEL = 32
 # Table 15/16: T1/T3 code n = 0.21 * 2^n s; T2/T4 code n = 0.21 * 2^(n-1) s (0 = 0 s).
 BASE_S = 0.21
+
+
+# (dx, dy): phase step per column / per row. The wave travels toward increasing phase and 2 == -1 (mod 3).
+DIRECTIONS = {"right": (1, 0), "left": (2, 0), "up": (0, 1), "down": (0, 2)}
 
 
 def build(panels, k_code, gcc, dx, dy, peak):
@@ -79,8 +85,10 @@ def main():
     ap.add_argument("--speed", type=int, default=3,
                     help="k code 0-6: colour step time 0.21*2^n s (default 3 = 1.68 s, period 5.04 s)")
     ap.add_argument("--gcc", type=int, default=100)
-    ap.add_argument("--dx", type=int, default=1, help="phase step per column (1, 2=reverse, 0=none)")
-    ap.add_argument("--dy", type=int, default=0, help="phase step per row (1 = travels up, 0 = none)")
+    ap.add_argument("--direction", choices=DIRECTIONS, default="right",
+                    help="which way the rainbow travels (default right); up/down move by rows")
+    ap.add_argument("--dx", type=int, help="override phase step per column (1 = right, 2 = left, 0 = none)")
+    ap.add_argument("--dy", type=int, help="override phase step per row (1 = up, 2 = down, 0 = none)")
     ap.add_argument("--peak", default="ff30a0",
                     help="RRGGBB peak brightness per channel (default ff30a0: the green LEDs are much "
                          "brighter than red, so G is held back to make yellow/orange/violet readable)")
@@ -89,7 +97,10 @@ def main():
     ap.add_argument("--stop", action="store_true", help="just reset the board")
     a = ap.parse_args()
 
-    cmds = ["reset"] if a.stop else build(a.panels, a.speed, a.gcc, a.dx, a.dy, a.peak)
+    dx, dy = DIRECTIONS[a.direction]
+    dx = dx if a.dx is None else a.dx
+    dy = dy if a.dy is None else a.dy
+    cmds = ["reset"] if a.stop else build(a.panels, a.speed, a.gcc, dx, dy, a.peak)
     if a.send:
         sys.exit(send(cmds, a.port))
     print("\n".join(cmds))
