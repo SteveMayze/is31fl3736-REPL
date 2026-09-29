@@ -81,7 +81,9 @@ def main():
     ap.add_argument("--gcc", type=int, default=100)
     ap.add_argument("--dx", type=int, default=1, help="phase step per column (1, 2=reverse, 0=none)")
     ap.add_argument("--dy", type=int, default=0, help="phase step per row (1 = travels up, 0 = none)")
-    ap.add_argument("--peak", default="ffffff", help="RRGGBB peak brightness per channel (default ffffff)")
+    ap.add_argument("--peak", default="ff30a0",
+                    help="RRGGBB peak brightness per channel (default ff30a0: the green LEDs are much "
+                         "brighter than red, so G is held back to make yellow/orange/violet readable)")
     ap.add_argument("--port", default="COM4")
     ap.add_argument("--send", action="store_true", help="send to the board instead of printing")
     ap.add_argument("--stop", action="store_true", help="just reset the board")
