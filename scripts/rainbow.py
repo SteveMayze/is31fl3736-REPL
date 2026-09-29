@@ -31,6 +31,10 @@ Usage
     rainbow.py                  print the REPL commands
     rainbow.py --send           send them to COM4 (through powershell.exe, WSL)
     rainbow.py --stop --send    reset the board / blank the LEDs
+
+Works from WSL or from native Windows (python rainbow.py --send); either way it talks to the port
+through powershell.exe and send.ps1. Close any serial monitor (VS Code/PlatformIO, PuTTY, Arduino, ...)
+first: COM4 can only be open in one program.
 """
 import argparse
 import os
@@ -81,7 +85,9 @@ def build(panels, k_code, gcc, dx, dy, peak):
 
 def send(cmds, port):
     here = os.path.dirname(os.path.abspath(__file__))
-    ps1 = subprocess.check_output(["wslpath", "-w", os.path.join(here, "send.ps1")], text=True).strip()
+    ps1 = os.path.join(here, "send.ps1")
+    if os.name != "nt":   # WSL: powershell.exe needs a Windows path
+        ps1 = subprocess.check_output(["wslpath", "-w", ps1], text=True).strip()
     p = subprocess.run(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-Port", port],
         input="\n".join(cmds) + "\n", text=True)
@@ -102,7 +108,7 @@ def main():
     ap.add_argument("--peak", default="ff30a0",
                     help="RRGGBB peak brightness per channel (default ff30a0: the green LEDs are much "
                          "brighter than red, so G is held back to make yellow/orange/violet readable)")
-    ap.add_argument("--port", default="COM4")
+    ap.add_argument("--port", default="COM4", help="Windows COM port (default COM4)")
     ap.add_argument("--send", action="store_true", help="send to the board instead of printing")
     ap.add_argument("--stop", action="store_true", help="just reset the board")
     a = ap.parse_args()

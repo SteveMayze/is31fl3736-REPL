@@ -12,7 +12,10 @@ $sp = New-Object System.IO.Ports.SerialPort $Port, $Baud, ([System.IO.Ports.Pari
 $sp.Handshake = [System.IO.Ports.Handshake]::None
 $sp.NewLine = "`n"
 $sp.ReadTimeout = 500
-$sp.Open()
+try { $sp.Open() } catch {
+  Write-Error "Cannot open ${Port}: $($_.Exception.InnerException.Message). Another program probably has it open (serial monitor, PuTTY, Arduino IDE, PlatformIO monitor...); close it and try again."
+  exit 1
+}
 try {
   $sp.DiscardInBuffer()
   # Wake the prompt and drain any banner.
