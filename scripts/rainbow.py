@@ -16,7 +16,8 @@ primary fades in while the next fades out, the third is off). LED phase p sees
 the colours of LED phase 0 delayed by p*k, so the rainbow travels toward
 increasing phase. Phase = (dx*x + dy*y) mod 3, with x left->right, y bottom->top, so
 --direction right/left/up/down (dx,dy = 1,0 / 2,0 / 0,1 / 0,2) picks which way it travels;
-up/down animate by rows, right/left by columns. --dx/--dy override it (step 2 == -1 mod 3).
+up/down animate by rows, right/left by columns. bl-tr/br-tl/tl-br/tr-bl (1,1 / 2,1 / 1,2 / 2,2)
+sweep diagonally from one corner to the opposite one. --dx/--dy override it (step 2 == -1 mod 3).
 
 Only three timing slots exist, so the pattern repeats every 3 LEDs along the
 travel direction.
@@ -39,7 +40,11 @@ BASE_S = 0.21
 
 
 # (dx, dy): phase step per column / per row. The wave travels toward increasing phase and 2 == -1 (mod 3).
-DIRECTIONS = {"right": (1, 0), "left": (2, 0), "up": (0, 1), "down": (0, 2)}
+DIRECTIONS = {
+    "right": (1, 0), "left": (2, 0), "up": (0, 1), "down": (0, 2),
+    # corner to opposite corner: BL = bottom left, TR = top right, etc.
+    "bl-tr": (1, 1), "br-tl": (2, 1), "tl-br": (1, 2), "tr-bl": (2, 2),
+}
 
 
 def build(panels, k_code, gcc, dx, dy, peak):
@@ -86,7 +91,8 @@ def main():
                     help="k code 0-6: colour step time 0.21*2^n s (default 3 = 1.68 s, period 5.04 s)")
     ap.add_argument("--gcc", type=int, default=100)
     ap.add_argument("--direction", choices=DIRECTIONS, default="right",
-                    help="which way the rainbow travels (default right); up/down move by rows")
+                    help="which way the rainbow travels (default right); up/down move by rows, "
+                         "bl-tr/br-tl/tl-br/tr-bl sweep corner to opposite corner")
     ap.add_argument("--dx", type=int, help="override phase step per column (1 = right, 2 = left, 0 = none)")
     ap.add_argument("--dy", type=int, help="override phase step per row (1 = up, 2 = down, 0 = none)")
     ap.add_argument("--peak", default="ff30a0",

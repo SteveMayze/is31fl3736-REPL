@@ -42,9 +42,11 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
       python3 scripts/rainbow.py --send          # run on COM4 (omit --send to print the commands)
       python3 scripts/rainbow.py --send --direction down            # animate by rows, top to bottom
       python3 scripts/rainbow.py --send --speed 2 --direction up    # faster, bottom to top
+      python3 scripts/rainbow.py --send --direction bl-tr           # diagonal, bottom-left to top-right
       python3 scripts/rainbow.py --stop --send   # reset the board
 
-  Options: `--panels`, `--speed 0-6` (step time 0.21*2^n s), `--gcc`, `--direction right|left|up|down` (default `right`; `up`/`down` animate by rows,
+  Options: `--panels`, `--speed 0-6` (step time 0.21*2^n s), `--gcc`, `--direction right|left|up|down|bl-tr|br-tl|tl-br|tr-bl` (default `right`; `up`/`down` animate by rows,
+  the corner pairs sweep diagonally, e.g. `bl-tr` = bottom-left to top-right,
   `left`/`right` by columns; `--dx/--dy` override the underlying phase steps),
   `--peak RRGGBB` (per-channel peak, default `ff30a0`: green LEDs are much brighter than red, so G is
   held back to keep yellow/orange/violet readable), `--port`.
