@@ -29,6 +29,13 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
 * reset                                 -> IC reset and re-init
 * dump                                  -> print current shadow state
 
+# Panel layout
+
+Inside each panel LED 0 is bottom-left and rows run bottom to top, X first. `load`/`fill` LED numbers
+are per panel in order (LED n is on panel n // 32), and on this rig panel 0 (the master, I2C 0x50) is the
+**top** panel of the stack, panel 2 the bottom. `scripts/rainbow.py` accounts for this so the three
+panels animate as one display.
+
 # Scripts (`scripts/`)
 
 * `send.ps1` - sends REPL commands (stdin or `-File`) to a COM port through .NET's `SerialPort` and
@@ -48,6 +55,8 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
   Options: `--panels`, `--speed 0-6` (step time 0.21*2^n s), `--gcc`, `--direction right|left|up|down|bl-tr|br-tl|tl-br|tr-bl` (default `right`; `up`/`down` animate by rows,
   the corner pairs sweep diagonally, e.g. `bl-tr` = bottom-left to top-right,
   `left`/`right` by columns; `--dx/--dy` override the underlying phase steps),
+  `--panel-order top-down|bottom-up` (default `top-down`: panel 0, the master, is the TOP panel of this
+  stack, so the stack is treated as one tall display; use `bottom-up` if yours is the other way up),
   `--peak RRGGBB` (per-channel peak, default `ff30a0`: green LEDs are much brighter than red, so G is
   held back to keep yellow/orange/violet readable), `--port`.
 * `capture.py`, `montage.py` - optional webcam checking (frames and contact sheets into `captures/`,
