@@ -4,13 +4,15 @@
 // Serial commands:
 //   help
 //   panel [<n 1-3>]                       -> number of panels incl. the master (default 1).
-//                                             Panels stack in Y: 8x4, 8x8 or 8x12 RGB LEDs.
+//                                             Panels stack in Y: 8x4, 8x8 or 8x12 RGB LEDs,
+//                                             with the master on TOP (see MASTER_AT_TOP).
 //                                             Changing it resets all panels and sets SYNC
 //                                             (master=01, slaves=10) when n > 1
 //   mode pwm                              -> global PWM mode (B_EN=0), all panels
 //   mode abm                              -> global Auto Breath mode (B_EN=1), all panels
 //   load pwm RRGGBB RRGGBB ...             -> one 6-hex-digit RRGGBB token per physical RGB
-//                                             LED (dot), starting at LED 0, e.g.
+//                                             LED (dot), starting at LED 0 = bottom-left of
+//                                             the whole display, e.g.
 //                                             load pwm 0a0b30 0a0b3f Fa7bC3
 //                                             (non-zero channel also turns that dot's On/Off bit on)
 //   load abm mR mG mB mR mG mB ...         -> one ABM mode (0-3) per colour channel: R,G,B of
@@ -18,7 +20,8 @@
 //                                             ABM dots breathe up to their PWM value, so
 //                                             'load pwm' them first
 //   fill pwm from <s> to <e> with RRGGBB ...  -> repeat the RRGGBB pattern over RGB LEDs s..e
-//                                             (X first, across panels), truncated at e
+//                                             (X first, then upward through the whole stack,
+//                                             whichever chip each LED is on), truncated at e
 //   fill abm from <s> to <e> with m m ...  -> repeat the mode pattern over the R,G,B channels
 //                                             of RGB LEDs s..e, truncated at e's B channel
 //   assign abm <n> <dot...>               -> same assignment, but by explicit dot index
@@ -45,9 +48,17 @@
 // Chip constants
 // ---------------------------------------------------------------------------
 
-// Panel 0 is the SYNC master; the others are SYNC slaves and sit below it in Y.
+// Panel 0 is the SYNC master; the others are SYNC slaves. Each board's address is set by its
+// ADDR1/ADDR2 solder jumpers, so a board's position on the shared I2C ribbon does not matter.
 // 7-bit addresses for Wire (8-bit write addresses 0xA0/0xA2/0xA4 >> 1).
 static const uint8_t MAX_PANELS = 3;
+
+// Physical assembly: the master (panel 0) is the TOP panel of the stack and the slaves sit below it.
+// LED numbers, however, are display coordinates (LED 0 = bottom-left of the whole display, X first,
+// then upward), so rgbDot() below maps them onto the chips. Set this to false if the master is ever
+// the bottom panel; nothing else needs to change.
+static const bool MASTER_AT_TOP = true;
+
 static const uint8_t PANEL_ADDR[MAX_PANELS] = {
   0x50, // master:  ADDR2=GND, ADDR1=GND -> A4:A3=00, A2:A1=00
   0x51, // slave 1: ADDR2=GND, ADDR1=SCL -> A4:A3=00, A2:A1=01
@@ -190,16 +201,19 @@ static void splitDot(uint16_t gdot, uint8_t &panel, uint8_t &dot) {
   dot = (uint8_t)(gdot % NUM_DOTS);
 }
 
-// Physical RGB LED layout: each panel is 8 LEDs in X (CS1..CS8) x 4 LEDs in Y
-// (SW row groups of 3), panels stacked in Y. LEDs are numbered X first: LED n
-// is at x = n%8, y = n/8, on panel y/4. Its channels on CS(x+1) are wired
-// B=SW(y'*3+1), G=SW(y'*3+2), R=SW(y'*3+3) (y' = y%4), i.e. the panel has R and
-// B in reverse SW order - this is the one place that swap lives.
+// Physical RGB LED layout: each panel is 8 LEDs in X (CS1..CS8) x 4 LEDs in Y (SW row groups of 3),
+// panels stacked in Y. LEDs are numbered as display coordinates, X first: LED n is at x = n % 8 and
+// display row n / 8, where row 0 is the BOTTOM row of the whole stack, whichever chip that row is on.
+// The master (panel 0) is the top panel when MASTER_AT_TOP, so the stack's bottom row belongs to the
+// last panel; within a panel, local row 0 (SW1-3) is its bottom row. A channel on CS(x+1) is wired
+// B=SW(y'*3+1), G=SW(y'*3+2), R=SW(y'*3+3) (y' = local row), i.e. the panel has R and B in reverse SW
+// order - this is the one place that swap lives.
 static uint16_t rgbDot(uint8_t led, uint8_t channel /*0=R,1=G,2=B*/) {
-  uint8_t panel = (uint8_t)(led / LEDS_PER_PANEL);
-  uint8_t local = (uint8_t)(led % LEDS_PER_PANEL);
-  uint8_t x = (uint8_t)(local % NUM_CS);
-  uint8_t y = (uint8_t)(local / NUM_CS);
+  uint8_t x = (uint8_t)(led % NUM_CS);
+  uint8_t row = (uint8_t)(led / NUM_CS);                    // 0 = bottom of the display
+  uint8_t panelFromBottom = (uint8_t)(row / (NUM_SW / 3));
+  uint8_t y = (uint8_t)(row % (NUM_SW / 3));                // row within the panel
+  uint8_t panel = MASTER_AT_TOP ? (uint8_t)(g_numPanels - 1 - panelFromBottom) : panelFromBottom;
   return (uint16_t)(panel * NUM_DOTS + (y * 3 + (2 - channel)) * NUM_CS + x);
 }
 

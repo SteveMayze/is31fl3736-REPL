@@ -19,9 +19,9 @@ increasing phase. Phase = (dx*x + dy*y) mod 3, with x left->right, y bottom->top
 up/down animate by rows, right/left by columns. bl-tr/br-tl/tl-br/tr-bl (1,1 / 2,1 / 1,2 / 2,2)
 sweep diagonally from one corner to the opposite one. --dx/--dy override it (step 2 == -1 mod 3).
 
-The panels are treated as one tall display. Inside a panel LED 0 is bottom-left and rows run
-bottom->top, but which panel is at the top depends on the stack: on this rig panel 0 (the master,
-I2C 0x50) is at the TOP, so --panel-order defaults to top-down (use bottom-up if panel 0 is at the bottom).
+The panels are treated as one tall display: the firmware numbers LEDs as display coordinates
+(LED 0 = bottom-left of the whole stack, X first, then upward, whichever chip they are on), so
+y = led // 8 here. This needs firmware with that mapping (see README, "Panel layout").
 
 Only three timing slots exist, so the pattern repeats every 3 LEDs along the
 travel direction.
@@ -51,15 +51,7 @@ DIRECTIONS = {
 }
 
 
-def stack_row(led, panels, panel_order):
-    """Row of LED `led` in the whole stack, counting 0 = bottom row."""
-    panel, local = divmod(led, LEDS_PER_PANEL)
-    if panel_order == "top-down":       # panel 0 is the top of the stack
-        panel = panels - 1 - panel
-    return panel * (LEDS_PER_PANEL // WIDTH) + local // WIDTH
-
-
-def build(panels, k_code, gcc, dx, dy, peak, panel_order):
+def build(panels, k_code, gcc, dx, dy, peak):
     if not 0 <= k_code <= 6:
         sys.exit("--speed must be 0..6 (k = 0.21 * 2^n seconds)")
     t13 = k_code          # T1 / T3 code -> k seconds
@@ -73,7 +65,7 @@ def build(panels, k_code, gcc, dx, dy, peak, panel_order):
     modes = []
     for led in range(n_leds):
         x = led % WIDTH
-        y = stack_row(led, panels, panel_order)
+        y = led // WIDTH          # display row, 0 = bottom of the whole stack
         p = (dx * x + dy * y) % 3
         modes += [1 + (p + c) % 3 for c in range(3)]   # R, G, B
     cmds.append("load abm " + " ".join(map(str, modes)))
@@ -105,9 +97,6 @@ def main():
     ap.add_argument("--direction", choices=DIRECTIONS, default="right",
                     help="which way the rainbow travels (default right); up/down move by rows, "
                          "bl-tr/br-tl/tl-br/tr-bl sweep corner to opposite corner")
-    ap.add_argument("--panel-order", choices=("top-down", "bottom-up"), default="top-down",
-                    help="stacking order of the panels: top-down = panel 0 (master) is the top panel "
-                         "(default, this rig), bottom-up = panel 0 is the bottom panel")
     ap.add_argument("--dx", type=int, help="override phase step per column (1 = right, 2 = left, 0 = none)")
     ap.add_argument("--dy", type=int, help="override phase step per row (1 = up, 2 = down, 0 = none)")
     ap.add_argument("--peak", default="ff30a0",
@@ -121,7 +110,7 @@ def main():
     dx, dy = DIRECTIONS[a.direction]
     dx = dx if a.dx is None else a.dx
     dy = dy if a.dy is None else a.dy
-    cmds = ["reset"] if a.stop else build(a.panels, a.speed, a.gcc, dx, dy, a.peak, a.panel_order)
+    cmds = ["reset"] if a.stop else build(a.panels, a.speed, a.gcc, dx, dy, a.peak)
     if a.send:
         sys.exit(send(cmds, a.port))
     print("\n".join(cmds))

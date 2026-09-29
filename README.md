@@ -8,11 +8,12 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
 # Serial commands:
 * help
 * panel [<n 1-3>]                       -> number of panels incl. the master (default 1); panels stack
-                                          in Y (8x4, 8x8 or 8x12 RGB LEDs). Resets all panels and sets
+                                          in Y with the master on top (8x4, 8x8 or 8x12 RGB LEDs). Resets all panels and sets
                                           SYNC (master/slaves) when n > 1
 * mode pwm                              -> global PWM mode (B_EN=0)
 * mode abm                              -> global Auto Breath mode (B_EN=1)
-* load pwm RRGGBB RRGGBB ...            -> one hex triplet per RGB LED, LED 0 upward (X first, then Y);
+* load pwm RRGGBB RRGGBB ...            -> one hex triplet per RGB LED, LED 0 = bottom-left of the display (X first,
+                                          then upward through all panels, see Panel layout);
                                           a non-zero channel also turns that dot on
 * load abm mR mG mB mR mG mB ...        -> one mode per colour channel, LED 0 upward
                                           (0 = PWM, 1-3 = ABM-1..3). ABM dots breathe up to their PWM
@@ -29,12 +30,27 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
 * reset                                 -> IC reset and re-init
 * dump                                  -> print current shadow state
 
-# Panel layout
+# Panel layout and assembly
 
-Inside each panel LED 0 is bottom-left and rows run bottom to top, X first. `load`/`fill` LED numbers
-are per panel in order (LED n is on panel n // 32), and on this rig panel 0 (the master, I2C 0x50) is the
-**top** panel of the stack, panel 2 the bottom. `scripts/rainbow.py` accounts for this so the three
-panels animate as one display.
+This is the reference the firmware, the scripts and the final DMX display should all follow.
+
+* **Panel:** 8 x 4 RGB LEDs on one IS31FL3736 (12 SW rows x 8 CS columns; each LED row is three SW rows,
+  SW1-3 = the bottom row). Schematic: `si31fl3736-REPL/doc/DMX-LED-Panel-Schematic.pdf`.
+* **Stack:** panels stack in Y into a display 8 LEDs wide and 4 LEDs tall per panel (8x8 for the 2-panel
+  final display, 8x12 for the 3-panel proof of concept). **The master (panel 0) is the TOP panel;** the
+  slaves sit below it.
+* **Numbering:** LEDs are display coordinates. LED 0 is the bottom-left of the whole display, X runs
+  left to right, then rows run bottom to top through all panels, whichever chip they are on. So LED n is
+  at x = n % 8, row n / 8, and `load`/`fill`/DMX all use this. (`assign abm` and `dump` use raw chip dot
+  indices, panel*96 + dot.) `MASTER_AT_TOP` in `main.cpp` holds the one assumption about the stack; set it
+  to `false` if the master is ever the bottom panel and nothing else changes.
+* **Addresses:** each board's I2C address is set by its ADDR1/ADDR2 solder jumpers (JP1-JP8), not by its
+  place on the ribbon: master 0x50 (ADDR1=GND, ADDR2=GND), panel 1 0x51 (ADDR1=SCL), panel 2 0x52
+  (ADDR1=SDA).
+* **Connection:** the 9-pin I/O connector (J1: IICRST, SDB, INT_B, SCL, SDA, SYNC, Vio, Vcc, GND) is one
+  shared bus, daisy chained on a ribbon; the order along the ribbon doesn't matter electrically. The
+  master drives SYNC (config SYNC=01) and the slaves take it (SYNC=10), so the ABM timers of all panels
+  run together; the firmware sets this when `panel n` is issued.
 
 # Scripts (`scripts/`)
 
@@ -55,8 +71,6 @@ panels animate as one display.
   Options: `--panels`, `--speed 0-6` (step time 0.21*2^n s), `--gcc`, `--direction right|left|up|down|bl-tr|br-tl|tl-br|tr-bl` (default `right`; `up`/`down` animate by rows,
   the corner pairs sweep diagonally, e.g. `bl-tr` = bottom-left to top-right,
   `left`/`right` by columns; `--dx/--dy` override the underlying phase steps),
-  `--panel-order top-down|bottom-up` (default `top-down`: panel 0, the master, is the TOP panel of this
-  stack, so the stack is treated as one tall display; use `bottom-up` if yours is the other way up),
   `--peak RRGGBB` (per-channel peak, default `ff30a0`: green LEDs are much brighter than red, so G is
   held back to keep yellow/orange/violet readable), `--port`.
 * `capture.py`, `montage.py` - optional webcam checking (frames and contact sheets into `captures/`,
