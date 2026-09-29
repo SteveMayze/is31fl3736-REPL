@@ -76,8 +76,9 @@ This is the reference the firmware, the scripts and the final DMX display should
 * `capture.py`, `montage.py` - optional webcam checking (frames and contact sheets into `captures/`,
   which is git-ignored). Run with a Windows venv with OpenCV:
 
-      python.exe -m venv .venv-win && .venv-win\Scripts\pip install opencv-python numpy
+      python.exe -m venv .venv-win && .venv-win\Scripts\pip install opencv-python numpy pygrabber
       .venv-win/Scripts/python.exe scripts/capture.py --index 0 --out captures/shot.jpg --exposure -8
 
-  Close other apps using the camera first. Very short exposures catch the multiplexing scan and show
+  Camera indices shift across reboots; use `--name C920` (or `--list`) instead of `--index`
+  (needs `pip install pygrabber`). Close other apps using the camera first. Very short exposures catch the multiplexing scan and show
   partial rows; lower `gcc` instead if the LEDs clip to white.

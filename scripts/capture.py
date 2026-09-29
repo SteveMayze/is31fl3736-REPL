@@ -3,6 +3,11 @@
     capture.py --index 0 --out shot.jpg
     capture.py --index 0 --out burst.jpg --frames 6 --interval 0.5   # burst_0.jpg ...
     capture.py --index 0 --out shot.jpg --exposure -6                # manual exposure
+    capture.py --name C920 --out shot.jpg                            # pick camera by name
+    capture.py --list                                                # show camera indices
+
+Camera indices change across reboots/replugs; --name is stable. Needs pygrabber
+(pip install pygrabber) to enumerate DirectShow device names.
 """
 import argparse
 import time
@@ -10,9 +15,26 @@ import time
 import cv2
 
 
+def device_names():
+    from pygrabber.dshow_graph import FilterGraph  # same order as OpenCV's CAP_DSHOW indices
+
+    return FilterGraph().get_input_devices()
+
+
+def find_index(name):
+    names = device_names()
+    hits = [i for i, n in enumerate(names) if name.lower() in n.lower()]
+    if len(hits) != 1:
+        found = ", ".join(f"{i}: {n}" for i, n in enumerate(names))
+        raise SystemExit(f"--name {name!r} matched {len(hits)} cameras; available: {found}")
+    return hits[0]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index", type=int, default=0)
+    ap.add_argument("--name", help="camera name substring (e.g. C920); overrides --index")
+    ap.add_argument("--list", action="store_true", help="list cameras and exit")
     ap.add_argument("--out", default="shot.jpg")
     ap.add_argument("--frames", type=int, default=1)
     ap.add_argument("--interval", type=float, default=0.5)
@@ -22,6 +44,12 @@ def main():
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
     a = ap.parse_args()
+    if a.list:
+        for i, n in enumerate(device_names()):
+            print(f"{i}: {n}")
+        return
+    if a.name:
+        a.index = find_index(a.name)
 
     cap = cv2.VideoCapture(a.index, cv2.CAP_DSHOW)
     if not cap.isOpened():
