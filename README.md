@@ -28,7 +28,7 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
                                           (default 0 = endless)
 * gcc <0-255>                           -> Global Current Control
 * reset                                 -> IC reset and re-init
-* wave <RRGGBB ...> [width <leds>] [speed <leds/s>] [dir <d>] [sharp <1-8>] [fps <5-60>]
+* wave <RRGGBB ...> [width <leds>] [plateau <leds>] [gap <leds>] [speed <leds/s>] [dir <d>] [sharp <1-8>] [fps <5-60>]
                                         -> smooth travelling wave generated on the Teensy in PWM (see "Wave modes").
                                           Colours tile over the LEDs in display order; `<d>` is right, left, up, down,
                                           bl-tr, br-tl, tl-br or tr-bl. Never an error: bad values use defaults or are
@@ -88,9 +88,9 @@ assignments; `wave off`, `reset`, `panel`, `mode`, `load`, `fill`, `assign` and 
   * **Rainbow (default):** each LED maps R, G, B to a rotation of the slots, so the colours crossfade
     through the primaries as the wave travels.
   * **PWM wave (`--pwm`):** the firmware animates it (see "Wave modes"); the script only sends a `wave`
-    command. `--colors` takes names or any RRGGBB (no snapping), `--width` (LEDs, default 8), `--wave-speed`
-    (LEDs/s, default 4, negative reverses), `--sharp 1-8` (narrower bright core), `--direction` and `--gcc`
-    apply. The ABM-only `--speed/--shape/--peak/--dx/--dy` are ignored. Example:
+    command. `--colors` takes names or any RRGGBB (no snapping), `--width` (LEDs in one whole bump: rise + plateau + fall, default 8), `--plateau` (LEDs held at full colour inside it, default 0), `--gap` (dark LEDs between bumps, default 0 = back to back, so the repeat distance is width + gap), `--speed`
+    (same 0-6 scale as the ABM modes: the wave moves one LED per step time, default 0), `--sharp 1-8` (narrower bright core), `--direction` and `--gcc`
+    apply. The ABM-only `--shape/--peak/--dx/--dy` are ignored. Reverse the travel with `--direction left|down`. Example:
     `python3 scripts/wave.py --send --pwm --colors red --direction up --width 10`.
   * **Colour wave (`--colors`):** each LED uses one slot for all of its lit channels, so it fades from
     black up to its colour and back to black. ABM dots always breathe to full intensity (measured: the PWM
@@ -110,12 +110,12 @@ assignments; `wave off`, `reset`, `panel`, `mode`, `load`, `fill`, `assign` and 
       python3 scripts/wave.py --send --colors red,blue --direction up   # alternating columns, rising
       python3 scripts/wave.py --stop --send   # reset the board
 
-  Options: `--panels`, `--speed 0-6` (step time 0.21*2^n s), `--gcc`, `--direction right|left|up|down|bl-tr|br-tl|tl-br|tr-bl` (default `right`; `up`/`down` animate by rows,
+  Options: `--panels`, `--speed 0-6` (0 = fastest, 6 = slowest; step time 0.21*2^n s; default 3, or 0 with `--pwm`), `--gcc`, `--direction right|left|up|down|bl-tr|br-tl|tl-br|tr-bl` (default `right`; `up`/`down` animate by rows,
   the corner pairs sweep diagonally, e.g. `bl-tr` = bottom-left to top-right,
   `left`/`right` by columns; `--dx/--dy` override the underlying phase steps),
   `--shape pulse|notch|saw-a|saw-b` (ABM breath profile: how the 3 slots' fade is shaped; `pulse` is the
   original rainbow timing; none of them can make the wave truly smooth),
-  `--pwm --width --wave-speed --sharp` (PWM wave), `--colors NAME|RRGGBB,...` (colour wave, see above), `--peak RRGGBB` (rainbow only: per-channel
+  `--pwm --width --plateau --gap --sharp` (PWM wave), `--colors NAME|RRGGBB,...` (colour wave, see above), `--peak RRGGBB` (rainbow only: per-channel
   peak, default `ff30a0`; note the measurement above, so this may have little effect), `--port`.
 * `capture.py`, `montage.py` - optional webcam checking (frames and contact sheets into `captures/`,
   which is git-ignored). Run with a Windows venv with OpenCV:

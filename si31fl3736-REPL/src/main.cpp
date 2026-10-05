@@ -37,10 +37,12 @@
 //                                             'loop' sets LTA:LTB, the repeat count (0 = endless)
 //   gcc <0-255>                           -> Global Current Control (PG3, 01h), all panels
 //   reset                                 -> trigger IC reset (read PG3, 11h) and re-init
-//   wave <RRGGBB ...> [width <leds>] [speed <leds/s>] [dir <d>] [sharp <1-8>] [fps <5-60>]
+//   wave <RRGGBB ...> [width <leds>] [plateau <leds>] [gap <leds>] [speed <leds/s>] [dir <d>]
+//                         [sharp <1-8>] [fps <5-60>]
 //                                         -> smooth travelling wave generated on the Teensy with PWM
-//                                             (not ABM): every LED fades between black and its colour
-//                                             as a raised-cosine bump 'width' LEDs long. Colours tile over
+//                                             (not ABM): every LED fades between black and its colour.
+//                                             One bump is 'width' LEDs long (rise + 'plateau' held at
+//                                             full + fall), bumps are 'gap' dark LEDs apart. Colours tile over
 //                                             the LEDs in display order (short = repeat, long = truncate,
 //                                             bad entry = black). <d> = right left up down bl-tr br-tl tl-br
 //                                             tr-bl. Never an error: bad or missing values fall back to
@@ -450,7 +452,9 @@ struct WaveState {
   uint8_t r[MAX_PANELS * LEDS_PER_PANEL];   // per-LED colour, the pattern already tiled
   uint8_t g[MAX_PANELS * LEDS_PER_PANEL];
   uint8_t b[MAX_PANELS * LEDS_PER_PANEL];
-  float width = 8.0f;                       // wavelength in LEDs
+  float width = 8.0f;                       // LEDs in one whole bump: rise + plateau + fall
+  float plateau = 0.0f;                     // LEDs held at full intensity inside the bump
+  float gap = 0.0f;                         // dark LEDs between one bump and the next
   float speed = 4.0f;                       // LEDs per second along the direction
   int8_t ax = 1, ay = 0;                    // travel direction in display coordinates (x right, y up)
   uint8_t sharp = 1;                        // bump exponent: higher = narrower bright core
@@ -459,15 +463,15 @@ struct WaveState {
   uint32_t frames = 0, lastFrameUs = 0;
 };
 static WaveState g_wave;
-static uint8_t g_bump[256];                 // raised-cosine profile over one wavelength, 0..255
+static uint8_t g_edge[256];                 // raised-cosine rise 0..255 (the fall is its mirror)
 static uint8_t g_gamma[256];                // linear intensity -> PWM
 
 static void buildWaveTables(uint8_t sharp) {
   for (uint16_t i = 0; i < 256; i++) {
-    float c = 0.5f * (1.0f + cosf(2.0f * 3.14159265f * (float)i / 256.0f));   // 1 at i=0 (bump centre)
+    float c = 0.5f * (1.0f - cosf(3.14159265f * (float)i / 255.0f));   // 0 -> 1 across the edge
     float v = c;
     for (uint8_t k = 1; k < sharp; k++) v *= c;
-    g_bump[i] = (uint8_t)(v * 255.0f + 0.5f);
+    g_edge[i] = (uint8_t)(v * 255.0f + 0.5f);
     g_gamma[i] = (uint8_t)(powf((float)i / 255.0f, GAMMA_EXP) * 255.0f + 0.5f);
   }
 }
@@ -500,12 +504,20 @@ static void waveRender() {
   memcpy(prev, g_pwm, sizeof(prev));
 
   float shift = g_wave.speed * (float)(millis() - g_wave.startMs) * 0.001f;
+  float period = g_wave.width + g_wave.gap;
+  float edge = (g_wave.width - g_wave.plateau) * 0.5f;      // LEDs in the rise, and in the fall
   uint8_t n = numLeds();
   for (uint8_t led = 0; led < n; led++) {
     int16_t x = led % NUM_CS, y = led / NUM_CS;
-    float phase = ((float)(g_wave.ax * x + g_wave.ay * y) - shift) / g_wave.width;
-    phase -= floorf(phase);
-    uint8_t level = g_bump[(uint8_t)(phase * 256.0f)];
+    float d = ((float)(g_wave.ax * x + g_wave.ay * y) - shift) / period;
+    d = (d - floorf(d)) * period;                            // LEDs into this bump, 0 .. period
+    uint8_t level = 0;
+    if (d < g_wave.width) {
+      if (edge < 0.001f)               level = 255;                          // no fade: a hard block
+      else if (d < edge)               level = g_edge[(uint8_t)(d / edge * 255.0f)];
+      else if (d < edge + g_wave.plateau) level = 255;
+      else                             level = g_edge[(uint8_t)((g_wave.width - d) / edge * 255.0f)];
+    }
     setDotPwmShadow(rgbDot(led, 0), g_gamma[(uint16_t)level * g_wave.r[led] / 255]);
     setDotPwmShadow(rgbDot(led, 1), g_gamma[(uint16_t)level * g_wave.g[led] / 255]);
     setDotPwmShadow(rgbDot(led, 2), g_gamma[(uint16_t)level * g_wave.b[led] / 255]);
@@ -545,7 +557,7 @@ static void startWave() {
 }
 
 static bool isWaveKeyword(const char *s) {
-  return !strcmp(s, "width") || !strcmp(s, "speed") || !strcmp(s, "dir") || !strcmp(s, "sharp") ||
+  return !strcmp(s, "width") || !strcmp(s, "plateau") || !strcmp(s, "gap") || !strcmp(s, "speed") || !strcmp(s, "dir") || !strcmp(s, "sharp") ||
          !strcmp(s, "fps") || !strcmp(s, "off");
 }
 
@@ -568,7 +580,7 @@ static void cmdWave(uint16_t argc, char *argv[]) {
   }
   if (nCol == 0) { cr[0] = cg[0] = cb[0] = 255; nCol = 1; }   // no colour given: white
 
-  float width = 8.0f, speed = 4.0f;
+  float width = 8.0f, plateau = 0.0f, gap = 0.0f, speed = 4.0f;
   int8_t ax = 1, ay = 0;
   uint8_t sharp = 1;
   uint16_t fps = 30;
@@ -585,7 +597,9 @@ static void cmdWave(uint16_t argc, char *argv[]) {
       char *end;
       float v = strtof(val, &end);
       if (end != val) {   // not a number: keep the default
-        if (!strcmp(key, "width"))      width = clampf(v, 2.0f, 64.0f);
+        if (!strcmp(key, "width"))      width = clampf(v, 1.0f, 64.0f);
+        else if (!strcmp(key, "plateau")) plateau = clampf(v, 0.0f, 64.0f);
+        else if (!strcmp(key, "gap"))   gap = clampf(v, 0.0f, 64.0f);
         else if (!strcmp(key, "speed")) speed = clampf(v, -60.0f, 60.0f);
         else if (!strcmp(key, "sharp")) sharp = (uint8_t)clampf(v, 1.0f, 8.0f);
         else if (!strcmp(key, "fps"))   fps = (uint16_t)clampf(v, 5.0f, 60.0f);
@@ -600,13 +614,15 @@ static void cmdWave(uint16_t argc, char *argv[]) {
     g_wave.g[led] = cg[led % nCol];
     g_wave.b[led] = cb[led % nCol];
   }
-  g_wave.width = width; g_wave.speed = speed; g_wave.ax = ax; g_wave.ay = ay;
+  if (plateau > width) plateau = width;                       // the hold can't be longer than the bump
+  g_wave.width = width; g_wave.plateau = plateau; g_wave.gap = gap; g_wave.speed = speed; g_wave.ax = ax; g_wave.ay = ay;
   g_wave.sharp = sharp; g_wave.frameMs = (uint16_t)(1000 / fps);
   buildWaveTables(sharp);
   if (!g_wave.active) startWave();
   g_wave.startMs = millis();
   Serial.print(F("OK wave "));
   Serial.print(nCol); Serial.print(F(" colour(s), width ")); Serial.print(width);
+  Serial.print(F(" plateau ")); Serial.print(plateau); Serial.print(F(" gap ")); Serial.print(gap);
   Serial.print(F(" speed ")); Serial.print(speed); Serial.print(F(" fps ")); Serial.println(fps);
 }
 
@@ -631,7 +647,8 @@ static void printHelp() {
   Serial.println(F("                                      loop = repeat count, default 0 = endless)"));
   Serial.println(F("  gcc <0-255>"));
   Serial.println(F("  reset"));
-  Serial.println(F("  wave <RRGGBB ...> [width <leds>] [speed <leds/s>] [dir right|left|up|down|bl-tr|br-tl|tl-br|tr-bl]"));
+  Serial.println(F("  wave <RRGGBB ...> [width <leds>] [plateau <leds>] [gap <leds>] [speed <leds/s>]"));
+  Serial.println(F("       [dir right|left|up|down|bl-tr|br-tl|tl-br|tr-bl]"));
   Serial.println(F("       [sharp <1-8>] [fps <5-60>]   (smooth PWM wave made on the Teensy; 'wave off' stops it)"));
   Serial.println(F("  dump"));
 }
