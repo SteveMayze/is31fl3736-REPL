@@ -39,6 +39,13 @@ The pattern is tiled over the LEDs, X first then upward, like the firmware's 'fi
 shorter than the display repeats and a longer one is truncated. An unrecognised entry is shown as black
 with a warning, never a failure (a DMX device has nobody to report errors to).
 
+Blink (--effect blink)
+----------------------
+The whole panel switches on and off in a colour (or a colour pattern, tiled like the waves), made by the
+firmware (`blink` command). --speed 0-6 sets the rate, 0 fastest like the waves: 100, 75, 25, 10, 2, 1, 0.5 Hz
+(6 = on for one second, off for one second). --duty sets the percentage of each period it is on (default 50).
+Above about 25 Hz persistence of vision makes it look like a steady, dimmer light.
+
 Usage
 -----
     wave.py                     print the REPL commands (rainbow)
@@ -46,6 +53,7 @@ Usage
     wave.py --colors red,blue --send        colour wave: red/blue tiles fading to black
     wave.py --pwm --colors red --send       smooth PWM wave made by the firmware (any RGB colour)
     wave.py --pwm --colors rainbow --send   continuous scrolling rainbow in PWM (rainbow-bump: spectrum per bump)
+    wave.py --effect blink --colors red --speed 5 --send   blink the whole panel red at 1 Hz
     wave.py --stop --send       reset the board / blank the LEDs
 
 Works from WSL or from native Windows (python wave.py --send); either way it talks to the port
@@ -157,6 +165,16 @@ def build(panels, k_code, gcc, dx, dy, peak, colors=None, shape="pulse"):
     return cmds
 
 
+BLINK_HZ = (100, 75, 25, 10, 2, 1, 0.5)   # --speed 0 (fastest) .. 6 (slowest)
+
+
+def build_blink(gcc, colors, k_code, duty):
+    """Commands for the firmware's blink effect; colors is a list of RRGGBB tokens (empty = white)."""
+    if not 0 <= k_code <= 6:
+        sys.exit("--speed must be 0..6 (blink: 100, 75, 25, 10, 2, 1, 0.5 Hz)")
+    return [f"gcc {gcc}", "blink " + " ".join(colors or ["ffffff"]) + f" hz {BLINK_HZ[k_code]:g} duty {duty:g}"]
+
+
 def build_pwm(gcc, direction, colors, width, plateau, gap, k_code, sharp):
     """Commands for the firmware's own PWM wave (smooth, any RGB colour; colors may be ["rainbow"] for a scrolling
     rainbow or ["rainbow-bump"] for the spectrum across each bump): the Teensy animates, we only send a few parameters. --speed uses the same scale as the ABM modes: the wave advances one LED per step time
@@ -182,13 +200,18 @@ def send(cmds, port):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--panels", type=int, default=3, choices=(1, 2, 3))
+    ap.add_argument("--effect", choices=("wave", "blink"), default="wave",
+                    help="wave (default): the travelling rainbow / colour waves; blink: the whole panel switches "
+                         "on and off (--colors, --speed, --duty, --gcc apply; --speed 0-6 = 100, 75, 25, 10, 2, 1, "
+                         "0.5 Hz, default 5)")
     ap.add_argument("--speed", type=int,
                     help="0 (fastest) to 6 (slowest): step time k = 0.21*2^n s, for ABM and --pwm alike. ABM: one "
                          "colour step per k (default 3 = 1.68 s, period 5.04 s); --pwm: the wave moves one LED "
-                         "per k (default 0 = 4.8 LEDs/s)")
+                         "per k (default 0 = 4.8 LEDs/s); --effect blink: the blink rate, 100 Hz at 0 down to "
+                         "0.5 Hz at 6 (default 5 = 1 Hz)")
     ap.add_argument("--gcc", type=int, default=100)
-    ap.add_argument("--direction", choices=DIRECTIONS, default="right",
-                    help="which way the rainbow travels (default right); up/down move by rows, "
+    ap.add_argument("--direction", choices=DIRECTIONS,
+                    help="which way the wave travels (default right); up/down move by rows, "
                          "bl-tr/br-tl/tl-br/tr-bl sweep corner to opposite corner")
     ap.add_argument("--dx", type=int, help="override phase step per column (1 = right, 2 = left, 0 = none)")
     ap.add_argument("--dy", type=int, help="override phase step per row (1 = up, 2 = down, 0 = none)")
@@ -214,10 +237,31 @@ def main():
     ap.add_argument("--gap", type=float,
                     help="--pwm: dark LEDs between one bump and the next (default 0 = back to back)")
     ap.add_argument("--sharp", type=int, help="--pwm: 1-8, higher = narrower bright core (default 1)")
+    ap.add_argument("--duty", type=float, help="--effect blink: percent of each period the panel is on (5-95, default 50)")
     ap.add_argument("--port", default="COM4", help="Windows COM port (default COM4)")
     ap.add_argument("--send", action="store_true", help="send to the board instead of printing")
     ap.add_argument("--stop", action="store_true", help="just reset the board")
     a = ap.parse_args()
+    if a.effect == "blink" and not a.stop:
+        ignored = [f"--{n}" for n in ("width", "plateau", "gap", "sharp", "direction", "dx", "dy")
+                   if getattr(a, n) is not None] + (["--pwm"] if a.pwm else [])
+        if ignored:
+            print(f"warning: {', '.join(ignored)} ignored for --effect blink", file=sys.stderr)
+        words = a.colors.replace(",", " ").split() if a.colors else []
+        if any(w.lower() in ("rainbow", "rainbow-bump") for w in words):
+            print("warning: rainbow is a wave colour; blink ignores it", file=sys.stderr)
+            words = [w for w in words if w.lower() not in ("rainbow", "rainbow-bump")]
+        duty = 50 if a.duty is None else a.duty
+        cmds = [f"panel {a.panels}"] + build_blink(
+            a.gcc, parse_colors(",".join(words), snap=False) if words else [],
+            5 if a.speed is None else a.speed, duty)
+        if a.send:
+            sys.exit(send(cmds, a.port))
+        print("\n".join(cmds))
+        return
+    if a.duty is not None:
+        print("warning: --duty only applies with --effect blink; ignored", file=sys.stderr)
+    a.direction = a.direction or "right"
     ignored = [f"--{n}" for n in ("width", "plateau", "gap", "sharp") if getattr(a, n) is not None]
     if ignored and not a.pwm:
         print(f"warning: {', '.join(ignored)} only apply with --pwm; ignored in the ABM modes", file=sys.stderr)

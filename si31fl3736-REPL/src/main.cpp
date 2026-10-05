@@ -54,6 +54,13 @@
 //                                             tr-bl. Never an error: bad or missing values fall back to
 //                                             defaults/clamps. 'wave off' (or any command that changes the
 //                                             LEDs) stops it
+//   blink <RRGGBB ...> [hz <0.1-100>] [duty <5-95>]
+//                                         -> the whole panel switches on and off in a colour (or a
+//                                             colour pattern tiled over the LEDs like 'wave'); 'duty' is
+//                                             the percentage of each period it is on (default 50, hz 1).
+//                                             Never an error: bad values use defaults or are clamped.
+//                                             'blink off', 'wave', or any command that changes the LEDs
+//                                             stops it
 //   dump                                  -> print current shadow state
 //
 // I2C addresses per panel are in PANEL_ADDR below (see Table 1 in the datasheet).
@@ -582,10 +589,8 @@ static void waveRender() {
   g_wave.lastFrameUs = micros() - t0;
 }
 
-// Stop the wave and leave the LEDs dark with the shadows consistent, so other commands start clean.
-static void stopWave() {
-  if (!g_wave.active) return;
-  g_wave.active = false;
+// Leave the LEDs dark with the shadows consistent, so other commands start clean.
+static void blankPwmDisplay() {
   uint8_t prev[MAX_PANELS][NUM_DOTS];
   memcpy(prev, g_pwm, sizeof(prev));
   memset(g_pwm, 0, sizeof(g_pwm));
@@ -594,7 +599,16 @@ static void stopWave() {
   flushOnOff();
 }
 
-static void startWave() {
+static void stopBlink();                      // defined with the blink effect below
+
+static void stopWave() {
+  if (!g_wave.active) return;
+  g_wave.active = false;
+  blankPwmDisplay();
+}
+
+// PWM display for the software-driven effects: B_EN=0, no dot on an ABM timer, every dot on (zero PWM = dark).
+static void enterPwmDisplay() {
   setGlobalMode(false);                       // B_EN=0: PWM mode
   uint8_t zeros[2 * NUM_CS - 1];
   memset(zeros, 0, sizeof(zeros));
@@ -606,6 +620,10 @@ static void startWave() {
   memset(g_abmAssign, 0, sizeof(g_abmAssign));
   for (uint8_t p = 0; p < g_numPanels; p++) memset(g_onoff[p], 0xFF, sizeof(g_onoff[p]));
   flushOnOff();                               // every dot on; zero PWM keeps it dark
+}
+
+static void startWave() {
+  enterPwmDisplay();
   g_wave.frames = 0;
   g_wave.startMs = g_wave.lastMs = millis();
   g_wave.active = true;
@@ -683,6 +701,7 @@ static void cmdWave(uint16_t argc, char *argv[]) {
   g_wave.width = width; g_wave.plateau = plateau; g_wave.gap = gap; g_wave.speed = speed; g_wave.ax = ax; g_wave.ay = ay;
   g_wave.sharp = sharp; g_wave.frameMs = (uint16_t)(1000 / fps);
   buildWaveTables(sharp);
+  stopBlink();                                // wave and blink never run together
   if (!g_wave.active) startWave();
   g_wave.startMs = millis();
   Serial.print(F("OK wave "));
@@ -690,6 +709,102 @@ static void cmdWave(uint16_t argc, char *argv[]) {
   Serial.print(F(", width ")); Serial.print(width);
   Serial.print(F(" plateau ")); Serial.print(plateau); Serial.print(F(" gap ")); Serial.print(gap);
   Serial.print(F(" speed ")); Serial.print(speed); Serial.print(F(" fps ")); Serial.println(fps);
+}
+
+// ---------------------------------------------------------------------------
+// Blink: the whole panel switches on and off, colours set once as static PWM
+// ---------------------------------------------------------------------------
+// Only two states, so nothing is re-rendered: the colours are written once and the Global Current Control
+// register is toggled between the user's gcc and 0 each half period (one register write per chip, so even 100 Hz
+// is cheap). Like the wave, it never reports an error: bad values use defaults or are clamped.
+
+struct BlinkState {
+  bool active = false;
+  bool on = true;
+  uint32_t onUs = 500000, offUs = 500000;   // half periods (duty cycle shapes them)
+  uint32_t nextUs = 0;                      // micros() of the next toggle
+  uint32_t toggles = 0, lastToggleUs = 0;
+};
+static BlinkState g_blink;
+
+static void setBlinkGcc(bool on) {
+  uint32_t t0 = micros();
+  writeFuncAll(FN_GCC, on ? g_gcc : 0);
+  g_blink.lastToggleUs = micros() - t0;
+}
+
+static void stopBlink() {
+  if (!g_blink.active) return;
+  g_blink.active = false;
+  writeFuncAll(FN_GCC, g_gcc);                // never leave the panel in its off phase
+  blankPwmDisplay();
+}
+
+// One animation at a time.
+static void stopAnimation() {
+  stopWave();
+  stopBlink();
+}
+
+static bool isBlinkKeyword(const char *s) {
+  return !strcmp(s, "hz") || !strcmp(s, "duty") || !strcmp(s, "off");
+}
+
+static void cmdBlink(uint16_t argc, char *argv[]) {
+  if (argc >= 2 && strcmp(argv[1], "off") == 0) {
+    stopBlink();
+    Serial.println(F("OK blink off"));
+    return;
+  }
+  // Colours first; a bad entry is black and the rainbow words (wave-only) are skipped.
+  static uint8_t cr[MAX_TOKENS], cg[MAX_TOKENS], cb[MAX_TOKENS];
+  uint16_t nCol = 0, i = 1;
+  for (; i < argc && !isBlinkKeyword(argv[i]); i++) {
+    if (equalsNoCase(argv[i], "rainbow") || equalsNoCase(argv[i], "rainbow-bump")) continue;
+    uint8_t r = 0, g = 0, b = 0;
+    if (!parseHexTriplet(argv[i], r, g, b)) r = g = b = 0;
+    cr[nCol] = r; cg[nCol] = g; cb[nCol] = b;
+    nCol++;
+  }
+  if (nCol == 0) { cr[0] = cg[0] = cb[0] = 255; nCol = 1; }   // no colour given: white
+
+  float hz = 1.0f, duty = 50.0f;
+  while (i < argc) {
+    const char *key = argv[i];
+    const char *val = (i + 1 < argc) ? argv[i + 1] : nullptr;
+    if (!isBlinkKeyword(key) || val == nullptr || !strcmp(key, "off")) { i++; continue; }   // unknown word: skip
+    char *end;
+    float v = strtof(val, &end);
+    if (end != val) {   // not a number: keep the default
+      if (!strcmp(key, "hz"))        hz = clampf(v, 0.1f, 100.0f);
+      else if (!strcmp(key, "duty")) duty = clampf(v, 5.0f, 95.0f);
+    }
+    i += 2;
+  }
+
+  stopWave();                                   // blink and wave never run together
+  if (!g_blink.active) enterPwmDisplay();
+  buildWaveTables(1);                           // gamma table, as for the wave colours
+  uint8_t prev[MAX_PANELS][NUM_DOTS];
+  memcpy(prev, g_pwm, sizeof(prev));
+  for (uint16_t led = 0; led < (uint16_t)numLeds(); led++) {
+    setDotPwmShadow(rgbDot((uint8_t)led, 0), g_gamma[cr[led % nCol]]);
+    setDotPwmShadow(rgbDot((uint8_t)led, 1), g_gamma[cg[led % nCol]]);
+    setDotPwmShadow(rgbDot((uint8_t)led, 2), g_gamma[cb[led % nCol]]);
+  }
+  for (uint8_t p = 0; p < g_numPanels; p++) flushPwmRows(p, prev[p]);
+
+  float periodUs = 1000000.0f / hz;
+  g_blink.onUs = (uint32_t)(periodUs * duty / 100.0f);
+  g_blink.offUs = (uint32_t)(periodUs - (float)g_blink.onUs);
+  g_blink.on = true;
+  writeFuncAll(FN_GCC, g_gcc);
+  g_blink.toggles = 0;
+  g_blink.nextUs = micros() + g_blink.onUs;
+  g_blink.active = true;
+  Serial.print(F("OK blink "));
+  Serial.print(nCol); Serial.print(F(" colour(s), ")); Serial.print(hz);
+  Serial.print(F(" Hz, duty ")); Serial.println(duty);
 }
 
 // ---------------------------------------------------------------------------
@@ -716,6 +831,7 @@ static void printHelp() {
   Serial.println(F("  wave <RRGGBB ...|rainbow|rainbow-bump> [width <leds>] [plateau <leds>] [gap <leds>] [speed <leds/s>]"));
   Serial.println(F("       [dir right|left|up|down|bl-tr|br-tl|tl-br|tr-bl]"));
   Serial.println(F("       [sharp <1-8>] [fps <5-60>]   (smooth PWM wave made on the Teensy; 'wave off' stops it)"));
+  Serial.println(F("  blink <RRGGBB ...> [hz <0.1-100>] [duty <5-95>]   (whole panel on/off; 'blink off' stops it)"));
   Serial.println(F("  dump"));
 }
 
@@ -988,7 +1104,8 @@ static void cmdGcc(uint16_t argc, char *argv[]) {
   if (argc < 2) { Serial.println(F("usage: gcc <0-255>")); return; }
   uint8_t value;
   if (!parseByte(argv[1], value)) { Serial.println(F("bad value")); return; }
-  setGcc(value);
+  if (g_blink.active && !g_blink.on) g_gcc = value;   // off phase: the next 'on' toggle applies it
+  else                               setGcc(value);
   Serial.print(F("OK gcc="));
   Serial.println(value);
 }
@@ -1004,6 +1121,10 @@ static void cmdDump() {
   if (g_wave.active) {
     Serial.print(F("wave: active, frames=")); Serial.print(g_wave.frames);
     Serial.print(F(" lastFrameUs=")); Serial.println(g_wave.lastFrameUs);
+  }
+  if (g_blink.active) {
+    Serial.print(F("blink: active, toggles=")); Serial.print(g_blink.toggles);
+    Serial.print(F(" lastToggleUs=")); Serial.println(g_blink.lastToggleUs);
   }
   Serial.println(F("pwm (dot:value), non-zero only:"));
   for (uint8_t p = 0; p < g_numPanels; p++) {
@@ -1032,7 +1153,7 @@ static void handleLine(char *line) {
 
   // Anything that rewrites the LEDs or the chip mode takes over from a running wave.
   static const char *const TAKEOVER[] = {"panel", "mode", "load", "fill", "assign", "define", "reset"};
-  for (const char *c : TAKEOVER) if (strcmp(argv[0], c) == 0) { stopWave(); break; }
+  for (const char *c : TAKEOVER) if (strcmp(argv[0], c) == 0) { stopAnimation(); break; }
 
   if (strcmp(argv[0], "help") == 0) {
     printHelp();
@@ -1055,6 +1176,8 @@ static void handleLine(char *line) {
     Serial.println(F("OK reset"));
   } else if (strcmp(argv[0], "wave") == 0) {
     cmdWave(argc, argv);
+  } else if (strcmp(argv[0], "blink") == 0) {
+    cmdBlink(argc, argv);
   } else if (strcmp(argv[0], "dump") == 0) {
     cmdDump();
   } else {
@@ -1118,7 +1241,20 @@ static void waveTick() {
   waveRender();
 }
 
+static void blinkTick() {
+  if (!g_blink.active) return;
+  uint32_t now = micros();
+  if ((int32_t)(now - g_blink.nextUs) < 0) return;
+  g_blink.on = !g_blink.on;
+  setBlinkGcc(g_blink.on);
+  g_blink.toggles++;
+  uint32_t half = g_blink.on ? g_blink.onUs : g_blink.offUs;
+  g_blink.nextUs += half;                     // keep the phase; resync if we fell more than a period behind
+  if ((int32_t)(now - g_blink.nextUs) > (int32_t)(g_blink.onUs + g_blink.offUs)) g_blink.nextUs = now + half;
+}
+
 void loop() {
   pollSerial();
   waveTick();
+  blinkTick();
 }

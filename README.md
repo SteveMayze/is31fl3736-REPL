@@ -33,6 +33,11 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
                                           `rainbow` instead of colours is a continuous scrolling rainbow and `rainbow-bump` paints the spectrum across each bump (see "Wave modes"). Colours tile over the LEDs in display order; `<d>` is right, left, up, down,
                                           bl-tr, br-tl, tl-br or tr-bl. Never an error: bad values use defaults or are
                                           clamped. `wave off`, or any command that changes the LEDs, stops it
+* blink <RRGGBB ...> [hz <0.1-100>] [duty <5-95>]
+                                        -> the whole panel switches on and off in a colour (a colour pattern tiles over
+                                          the LEDs like `wave`); `duty` is the percentage of each period it is on
+                                          (default 50, hz 1). Never an error: bad values use defaults or are clamped.
+                                          `blink off`, `wave`, or any command that changes the LEDs stops it
 * dump                                  -> print current shadow state
 
 # Panel layout and assembly
@@ -57,7 +62,12 @@ This is the reference the firmware, the scripts and the final DMX display should
   master drives SYNC (config SYNC=01) and the slaves take it (SYNC=10), so the ABM timers of all panels
   run together; the firmware sets this when `panel n` is issued.
 
-# Wave modes
+# Effects
+
+The script's `--effect wave` (default) is the travelling wave in the modes below; `--effect blink` is the
+blink described after them. Only one effect runs at a time.
+
+## Wave modes
 
 Three ways to get a travelling wave, all keeping the REPL available:
 
@@ -100,6 +110,24 @@ and fades to nothing a third of the wheel away, so no colour, red in particular,
 A rainbow frame takes about 5-8 ms. `--colors rainbow` or `rainbow-bump` without `--pwm` just runs the normal
 ABM rainbow.
 
+## Blink
+
+`wave.py --effect blink` (REPL: `blink`) switches the whole panel on and off in a colour, or in a colour pattern
+tiled over the LEDs like the waves (`--colors red,blue`; any RGB, rainbow names are ignored with a warning).
+`--speed` sets the rate with the same direction as the waves (0 fastest, 6 slowest):
+
+| `--speed` | 0 | 1 | 2 | 3 | 4 | 5 (default) | 6 |
+|-----------|---|---|---|---|---|---|---|
+| blink rate | 100 Hz | 75 Hz | 25 Hz | 10 Hz | 2 Hz | 1 Hz | 0.5 Hz |
+
+At 6 the panel is on for one second and then off for one second. `--duty` is the percentage of each period it
+is on (5-95, default 50). The colours are written once as static PWM and the firmware toggles the chip's
+Global Current Control register between your `--gcc` and 0, which is one register write per chip (about 0.8 ms
+for three panels), so even 100 Hz needs no frame rendering. Measured rates matched the table to within about 1%
+at the fast end (from the toggle counter in `dump`). Above roughly 25 Hz persistence of vision makes it look
+like a steady, dimmer light. Example: `python3 scripts/wave.py --send --effect blink --colors red --speed 5`.
+Wave-only options (`--width`, `--plateau`, `--gap`, `--sharp`, `--direction`) are ignored for blink with a warning.
+
 # Scripts (`scripts/`)
 
 * `send.ps1` - sends REPL commands (stdin or `-File`) to a COM port through .NET's `SerialPort` and
@@ -133,7 +161,7 @@ ABM rainbow.
       python3 scripts/wave.py --send --colors red,blue --direction up   # alternating columns, rising
       python3 scripts/wave.py --stop --send   # reset the board
 
-  Options: `--panels`, `--speed 0-6` (0 = fastest, 6 = slowest; step time 0.21*2^n s; default 3, or 0 with `--pwm`), `--gcc`, `--direction right|left|up|down|bl-tr|br-tl|tl-br|tr-bl` (default `right`; `up`/`down` animate by rows,
+  Options: `--panels`, `--speed 0-6` (0 = fastest, 6 = slowest; step time 0.21*2^n s; default 3, 0 with `--pwm`, or 5 = 1 Hz with `--effect blink`, where it is the blink rate), `--effect wave|blink`, `--duty 5-95` (blink), `--gcc`, `--direction right|left|up|down|bl-tr|br-tl|tl-br|tr-bl` (default `right`; `up`/`down` animate by rows,
   the corner pairs sweep diagonally, e.g. `bl-tr` = bottom-left to top-right,
   `left`/`right` by columns; `--dx/--dy` override the underlying phase steps),
   `--shape pulse|notch|saw-a|saw-b` (ABM breath profile: how the 3 slots' fade is shaped; `pulse` is the
