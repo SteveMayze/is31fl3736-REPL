@@ -17,8 +17,8 @@
 //                                             (non-zero channel also turns that dot's On/Off bit on)
 //   load abm mR mG mB mR mG mB ...         -> one ABM mode (0-3) per colour channel: R,G,B of
 //                                             LED 0, then R,G,B of LED 1, ... (LEDs X first).
-//                                             ABM dots breathe up to their PWM value, so
-//                                             'load pwm' them first
+//                                             ABM dots always breathe 0 -> full (their PWM
+//                                             value does not scale the peak)
 //   fill pwm from <s> to <e> with RRGGBB ...  -> repeat the RRGGBB pattern over RGB LEDs s..e
 //                                             (X first, then upward through the whole stack,
 //                                             whichever chip each LED is on), truncated at e
@@ -37,6 +37,15 @@
 //                                             'loop' sets LTA:LTB, the repeat count (0 = endless)
 //   gcc <0-255>                           -> Global Current Control (PG3, 01h), all panels
 //   reset                                 -> trigger IC reset (read PG3, 11h) and re-init
+//   wave <RRGGBB ...> [width <leds>] [speed <leds/s>] [dir <d>] [sharp <1-8>] [fps <5-60>]
+//                                         -> smooth travelling wave generated on the Teensy with PWM
+//                                             (not ABM): every LED fades between black and its colour
+//                                             as a raised-cosine bump 'width' LEDs long. Colours tile over
+//                                             the LEDs in display order (short = repeat, long = truncate,
+//                                             bad entry = black). <d> = right left up down bl-tr br-tl tl-br
+//                                             tr-bl. Never an error: bad or missing values fall back to
+//                                             defaults/clamps. 'wave off' (or any command that changes the
+//                                             LEDs) stops it
 //   dump                                  -> print current shadow state
 //
 // I2C addresses per panel are in PANEL_ADDR below (see Table 1 in the datasheet).
@@ -315,7 +324,7 @@ static void setGlobalMode(bool abm) {
 // Assign a dot's per-dot Auto Breath Mode selection register (00=PWM control,
 // 01/10/11 = ABM-1/2/3). Required for a dot to actually run any ABM timing.
 // Also updates the On/Off shadow - caller must flushOnOff() afterwards.
-// Note: in ABM the dot breathes up to its PWM register value, so PWM must be >0.
+// Note: an ABM dot always breathes 0 -> full intensity; its PWM register does not scale the peak.
 static void assignDotAbm(uint16_t gdot, uint8_t mode /*0-3*/) {
   if (gdot >= numDots() || mode > 3) return;
   uint8_t panel, dot, sw, cs;
@@ -327,7 +336,8 @@ static void assignDotAbm(uint16_t gdot, uint8_t mode /*0-3*/) {
   syncDotOnOff(panel, dot);
 }
 
-// Count dots assigned to an ABM slot whose PWM (= breath peak) is still 0.
+// Count dots assigned to an ABM slot whose PWM is still 0 (they still breathe, but keep a non-zero PWM
+// anyway so the On/Off shadow and 'dump' show them as lit).
 static uint16_t countDarkAbmDots() {
   uint16_t n = 0;
   for (uint8_t p = 0; p < g_numPanels; p++) {
@@ -343,7 +353,7 @@ static void warnDarkAbmDots() {
   if (n == 0) return;
   Serial.print(F("warning: "));
   Serial.print(n);
-  Serial.println(F(" ABM dot(s) have PWM=0 - ABM breathes up to the PWM value, use 'load pwm' to set it"));
+  Serial.println(F(" ABM dot(s) have PWM=0 - they still breathe to full intensity; assign 0 to keep a channel dark"));
 }
 
 // Program one ABM slot's timing on every panel and commit it per the
@@ -426,6 +436,181 @@ static bool parseHexTriplet(const char *s, uint8_t &r, uint8_t &g, uint8_t &b) {
 }
 
 // ---------------------------------------------------------------------------
+// PWM wave: a smooth travelling bump generated here and written as PWM frames
+// ---------------------------------------------------------------------------
+// ABM only has 3 timers (3 phases along the travel direction) and each dot can only fade 0 -> full, so it
+// cannot draw a smooth bump. This mode instead computes every LED's brightness each frame and writes the
+// changed PWM rows, so any width, speed and RGB colour works. The host (REPL now, DMX later) only supplies a
+// few parameters. Nothing here ever reports an error: bad values fall back to defaults or are clamped.
+
+static const float GAMMA_EXP = 2.2f;   // PWM = 255 * (intensity/255)^GAMMA_EXP, so steps look even to the eye
+
+struct WaveState {
+  bool active = false;
+  uint8_t r[MAX_PANELS * LEDS_PER_PANEL];   // per-LED colour, the pattern already tiled
+  uint8_t g[MAX_PANELS * LEDS_PER_PANEL];
+  uint8_t b[MAX_PANELS * LEDS_PER_PANEL];
+  float width = 8.0f;                       // wavelength in LEDs
+  float speed = 4.0f;                       // LEDs per second along the direction
+  int8_t ax = 1, ay = 0;                    // travel direction in display coordinates (x right, y up)
+  uint8_t sharp = 1;                        // bump exponent: higher = narrower bright core
+  uint16_t frameMs = 33;
+  uint32_t startMs = 0, lastMs = 0;
+  uint32_t frames = 0, lastFrameUs = 0;
+};
+static WaveState g_wave;
+static uint8_t g_bump[256];                 // raised-cosine profile over one wavelength, 0..255
+static uint8_t g_gamma[256];                // linear intensity -> PWM
+
+static void buildWaveTables(uint8_t sharp) {
+  for (uint16_t i = 0; i < 256; i++) {
+    float c = 0.5f * (1.0f + cosf(2.0f * 3.14159265f * (float)i / 256.0f));   // 1 at i=0 (bump centre)
+    float v = c;
+    for (uint8_t k = 1; k < sharp; k++) v *= c;
+    g_bump[i] = (uint8_t)(v * 255.0f + 0.5f);
+    g_gamma[i] = (uint8_t)(powf((float)i / 255.0f, GAMMA_EXP) * 255.0f + 0.5f);
+  }
+}
+
+// PWM shadow update without the per-dot I2C write; flushPwmRows() writes whole rows.
+static void setDotPwmShadow(uint16_t gdot, uint8_t value) {
+  uint8_t panel, dot;
+  splitDot(gdot, panel, dot);
+  g_pwm[panel][dot] = value;
+}
+
+// Write the PWM shadow of one panel, one SW row (15 bytes: CS1..CS8 at stride 2) per block write, and only
+// the rows that differ from what was last sent (prev).
+static void flushPwmRows(uint8_t panel, const uint8_t *prev) {
+  selectChip(panel);
+  if (!selectPage(PAGE_PWM)) return;
+  uint8_t row[2 * NUM_CS - 1];
+  for (uint8_t sw = 0; sw < NUM_SW; sw++) {
+    const uint8_t *cur = &g_pwm[panel][sw * NUM_CS];
+    if (memcmp(cur, prev + sw * NUM_CS, NUM_CS) == 0) continue;
+    memset(row, 0, sizeof(row));
+    for (uint8_t cs = 0; cs < NUM_CS; cs++) row[cs * 2] = cur[cs];
+    i2cWriteBlock((uint8_t)(sw * 0x10), row, sizeof(row));
+  }
+}
+
+static void waveRender() {
+  uint32_t t0 = micros();
+  uint8_t prev[MAX_PANELS][NUM_DOTS];
+  memcpy(prev, g_pwm, sizeof(prev));
+
+  float shift = g_wave.speed * (float)(millis() - g_wave.startMs) * 0.001f;
+  uint8_t n = numLeds();
+  for (uint8_t led = 0; led < n; led++) {
+    int16_t x = led % NUM_CS, y = led / NUM_CS;
+    float phase = ((float)(g_wave.ax * x + g_wave.ay * y) - shift) / g_wave.width;
+    phase -= floorf(phase);
+    uint8_t level = g_bump[(uint8_t)(phase * 256.0f)];
+    setDotPwmShadow(rgbDot(led, 0), g_gamma[(uint16_t)level * g_wave.r[led] / 255]);
+    setDotPwmShadow(rgbDot(led, 1), g_gamma[(uint16_t)level * g_wave.g[led] / 255]);
+    setDotPwmShadow(rgbDot(led, 2), g_gamma[(uint16_t)level * g_wave.b[led] / 255]);
+  }
+  for (uint8_t p = 0; p < g_numPanels; p++) flushPwmRows(p, prev[p]);
+  g_wave.frames++;
+  g_wave.lastFrameUs = micros() - t0;
+}
+
+// Stop the wave and leave the LEDs dark with the shadows consistent, so other commands start clean.
+static void stopWave() {
+  if (!g_wave.active) return;
+  g_wave.active = false;
+  uint8_t prev[MAX_PANELS][NUM_DOTS];
+  memcpy(prev, g_pwm, sizeof(prev));
+  memset(g_pwm, 0, sizeof(g_pwm));
+  for (uint8_t p = 0; p < g_numPanels; p++) flushPwmRows(p, prev[p]);
+  memset(g_onoff, 0, sizeof(g_onoff));
+  flushOnOff();
+}
+
+static void startWave() {
+  setGlobalMode(false);                       // B_EN=0: PWM mode
+  uint8_t zeros[2 * NUM_CS - 1];
+  memset(zeros, 0, sizeof(zeros));
+  for (uint8_t p = 0; p < g_numPanels; p++) {  // no dot may stay on an ABM timer
+    selectChip(p);
+    if (!selectPage(PAGE_ABM)) continue;
+    for (uint8_t sw = 0; sw < NUM_SW; sw++) i2cWriteBlock((uint8_t)(sw * 0x10), zeros, sizeof(zeros));
+  }
+  memset(g_abmAssign, 0, sizeof(g_abmAssign));
+  for (uint8_t p = 0; p < g_numPanels; p++) memset(g_onoff[p], 0xFF, sizeof(g_onoff[p]));
+  flushOnOff();                               // every dot on; zero PWM keeps it dark
+  g_wave.frames = 0;
+  g_wave.startMs = g_wave.lastMs = millis();
+  g_wave.active = true;
+}
+
+static bool isWaveKeyword(const char *s) {
+  return !strcmp(s, "width") || !strcmp(s, "speed") || !strcmp(s, "dir") || !strcmp(s, "sharp") ||
+         !strcmp(s, "fps") || !strcmp(s, "off");
+}
+
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static void cmdWave(uint16_t argc, char *argv[]) {
+  if (argc >= 2 && strcmp(argv[1], "off") == 0) {
+    stopWave();
+    Serial.println(F("OK wave off"));
+    return;
+  }
+  // Colours come first; anything that is not a valid RRGGBB is shown as black.
+  static uint8_t cr[MAX_TOKENS], cg[MAX_TOKENS], cb[MAX_TOKENS];
+  uint16_t nCol = 0, i = 1;
+  for (; i < argc && !isWaveKeyword(argv[i]); i++) {
+    uint8_t r = 0, g = 0, b = 0;
+    if (!parseHexTriplet(argv[i], r, g, b)) r = g = b = 0;
+    cr[nCol] = r; cg[nCol] = g; cb[nCol] = b;
+    nCol++;
+  }
+  if (nCol == 0) { cr[0] = cg[0] = cb[0] = 255; nCol = 1; }   // no colour given: white
+
+  float width = 8.0f, speed = 4.0f;
+  int8_t ax = 1, ay = 0;
+  uint8_t sharp = 1;
+  uint16_t fps = 30;
+  while (i < argc) {
+    const char *key = argv[i];
+    const char *val = (i + 1 < argc) ? argv[i + 1] : nullptr;
+    if (!isWaveKeyword(key) || val == nullptr || !strcmp(key, "off")) { i++; continue; }   // unknown word: skip
+    if (!strcmp(key, "dir")) {
+      static const struct { const char *n; int8_t x, y; } DIRS[] = {
+        {"right", 1, 0}, {"left", -1, 0}, {"up", 0, 1}, {"down", 0, -1},
+        {"bl-tr", 1, 1}, {"br-tl", -1, 1}, {"tl-br", 1, -1}, {"tr-bl", -1, -1}};
+      for (const auto &d : DIRS) if (!strcmp(val, d.n)) { ax = d.x; ay = d.y; }
+    } else {
+      char *end;
+      float v = strtof(val, &end);
+      if (end != val) {   // not a number: keep the default
+        if (!strcmp(key, "width"))      width = clampf(v, 2.0f, 64.0f);
+        else if (!strcmp(key, "speed")) speed = clampf(v, -60.0f, 60.0f);
+        else if (!strcmp(key, "sharp")) sharp = (uint8_t)clampf(v, 1.0f, 8.0f);
+        else if (!strcmp(key, "fps"))   fps = (uint16_t)clampf(v, 5.0f, 60.0f);
+      }
+    }
+    i += 2;
+  }
+
+  // Tile the colour pattern over the LEDs in display order (short = repeat, long = truncate).
+  for (uint16_t led = 0; led < (uint16_t)numLeds(); led++) {
+    g_wave.r[led] = cr[led % nCol];
+    g_wave.g[led] = cg[led % nCol];
+    g_wave.b[led] = cb[led % nCol];
+  }
+  g_wave.width = width; g_wave.speed = speed; g_wave.ax = ax; g_wave.ay = ay;
+  g_wave.sharp = sharp; g_wave.frameMs = (uint16_t)(1000 / fps);
+  buildWaveTables(sharp);
+  if (!g_wave.active) startWave();
+  g_wave.startMs = millis();
+  Serial.print(F("OK wave "));
+  Serial.print(nCol); Serial.print(F(" colour(s), width ")); Serial.print(width);
+  Serial.print(F(" speed ")); Serial.print(speed); Serial.print(F(" fps ")); Serial.println(fps);
+}
+
+// ---------------------------------------------------------------------------
 // Command implementations
 // ---------------------------------------------------------------------------
 
@@ -446,6 +631,8 @@ static void printHelp() {
   Serial.println(F("                                      loop = repeat count, default 0 = endless)"));
   Serial.println(F("  gcc <0-255>"));
   Serial.println(F("  reset"));
+  Serial.println(F("  wave <RRGGBB ...> [width <leds>] [speed <leds/s>] [dir right|left|up|down|bl-tr|br-tl|tl-br|tr-bl]"));
+  Serial.println(F("       [sharp <1-8>] [fps <5-60>]   (smooth PWM wave made on the Teensy; 'wave off' stops it)"));
   Serial.println(F("  dump"));
 }
 
@@ -731,6 +918,10 @@ static void cmdDump() {
     Serial.print(F(" @0x")); Serial.print(PANEL_ADDR[p], HEX);
     Serial.print(F(" config=0x")); Serial.println(g_config[p], HEX);
   }
+  if (g_wave.active) {
+    Serial.print(F("wave: active, frames=")); Serial.print(g_wave.frames);
+    Serial.print(F(" lastFrameUs=")); Serial.println(g_wave.lastFrameUs);
+  }
   Serial.println(F("pwm (dot:value), non-zero only:"));
   for (uint8_t p = 0; p < g_numPanels; p++) {
     for (uint8_t d = 0; d < NUM_DOTS; d++) {
@@ -756,6 +947,10 @@ static void handleLine(char *line) {
   uint16_t argc = tokenize(line, argv, MAX_TOKENS);
   if (argc == 0) return;
 
+  // Anything that rewrites the LEDs or the chip mode takes over from a running wave.
+  static const char *const TAKEOVER[] = {"panel", "mode", "load", "fill", "assign", "define", "reset"};
+  for (const char *c : TAKEOVER) if (strcmp(argv[0], c) == 0) { stopWave(); break; }
+
   if (strcmp(argv[0], "help") == 0) {
     printHelp();
   } else if (strcmp(argv[0], "panel") == 0) {
@@ -775,6 +970,8 @@ static void handleLine(char *line) {
   } else if (strcmp(argv[0], "reset") == 0) {
     chipReset();
     Serial.println(F("OK reset"));
+  } else if (strcmp(argv[0], "wave") == 0) {
+    cmdWave(argc, argv);
   } else if (strcmp(argv[0], "dump") == 0) {
     cmdDump();
   } else {
@@ -830,6 +1027,15 @@ void setup() {
   Serial.print(F("> "));
 }
 
+static void waveTick() {
+  if (!g_wave.active) return;
+  uint32_t now = millis();
+  if (now - g_wave.lastMs < g_wave.frameMs) return;
+  g_wave.lastMs = now;     // a slow frame just delays the next one; frames are never queued
+  waveRender();
+}
+
 void loop() {
   pollSerial();
+  waveTick();
 }

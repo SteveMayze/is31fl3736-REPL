@@ -44,6 +44,7 @@ Usage
     wave.py                     print the REPL commands (rainbow)
     wave.py --send              send them to COM4 (through powershell.exe, WSL)
     wave.py --colors red,blue --send        colour wave: red/blue tiles fading to black
+    wave.py --pwm --colors red --send       smooth PWM wave made by the firmware (any RGB colour)
     wave.py --stop --send       reset the board / blank the LEDs
 
 Works from WSL or from native Windows (python wave.py --send); either way it talks to the port
@@ -73,25 +74,56 @@ NAMES = {"black": "000000", "red": "ff0000", "green": "00ff00", "blue": "0000ff"
          "yellow": "ffff00", "cyan": "00ffff", "magenta": "ff00ff", "white": "ffffff"}
 
 
-def parse_colors(text):
-    """Split 'red,00ff00 ...' into on/off RRGGBB tokens (each channel 00 or ff): names or hex, snapped to the
-    nearest of the 8 ABM colours. Anything unrecognised becomes 000000 with a warning, never an error."""
+# Breath profile of the three slots: (T1 fade in, T2 hold, T3 fade out, T4 off) in units of k = 0.21 * 2^--speed s,
+# each a power of two (T2/T4 may be 0). The three slots are the same waveform a third of a period apart, so the
+# period must be a multiple of 3 units and each offset must land on a segment boundary (what 'start' selects).
+SHAPES = {
+    "pulse": (1, 0, 1, 1),   # narrow bright pulse hopping along (the original rainbow timing)
+    "notch": (1, 1, 1, 0),   # always lit except for a dark notch travelling along
+    "saw-a": (1, 2, 2, 1),   # quick rise, slow fall
+    "saw-b": (2, 2, 1, 1),   # slow rise, quick fall
+}
+
+
+def slot_timing(shape, k_code):
+    """T1..T4 register codes and the 'start' value (1-4) of the 3 slots for a shape; slot p lags slot 0 by p/3 period."""
+    a, b, c, d = SHAPES[shape]
+    period = a + b + c + d
+    bounds = [0, a, a + b, a + b + c]            # where T1..T4 begin within the cycle
+    code = lambda t, n: 0 if t == 0 else k_code + t.bit_length() - 1 + n   # n=0: T1/T3 table, n=1: T2/T4 table
+    codes = (code(a, 0), code(b, 1), code(c, 0), code(d, 1))
+    if max(codes[0], codes[2]) > 7 or codes[1] > 8 or codes[3] > 10:
+        sys.exit("--speed too high for this --shape (a T register would exceed its range)")
+    lengths = (a, b, c, d)
+    for base in bounds:                           # slot 0 may itself start at a later boundary
+        # prefer the segment with a length: a zero-length T2/T4 would start the loop on the next segment anyway
+        pick = [[i for i in range(4) if bounds[i] == (base - p * period // 3) % period and lengths[i]]
+                for p in range(3)]
+        if all(pick):
+            return codes, [i[0] + 1 for i in pick]
+    sys.exit(f"shape {shape!r} cannot offset its slots by a third of a period")
+
+
+def parse_colors(text, snap=True):
+    """Split 'red,00ff00 ...' into RRGGBB tokens: names or hex. With snap (ABM) each channel becomes 00 or ff, the
+    nearest of the 8 ABM colours; without it (PWM wave) any colour is kept. Anything unrecognised becomes 000000
+    with a warning, never an error."""
     out = []
     for tok in text.replace(",", " ").split():
         tok = NAMES.get(tok.lower(), tok.lstrip("#"))
         if len(tok) == 6 and all(c in "0123456789abcdefABCDEF" for c in tok):
-            out.append("".join("ff" if int(tok[i:i + 2], 16) >= 0x80 else "00" for i in (0, 2, 4)))
+            out.append("".join("ff" if int(tok[i:i + 2], 16) >= 0x80 else "00" for i in (0, 2, 4))
+                       if snap else tok.lower())
         else:
             print(f"warning: bad colour {tok!r}, using 000000", file=sys.stderr)
             out.append("000000")
     return out or ["000000"]
 
 
-def build(panels, k_code, gcc, dx, dy, peak, colors=None):
+def build(panels, k_code, gcc, dx, dy, peak, colors=None, shape="pulse"):
     if not 0 <= k_code <= 6:
         sys.exit("--speed must be 0..6 (k = 0.21 * 2^n seconds)")
-    t13 = k_code          # T1 / T3 code -> k seconds
-    t4 = k_code + 1       # T4 code      -> same k seconds
+    (t1, t2, t3, t4), starts = slot_timing(shape, k_code)
     cmds = [f"panel {panels}", f"gcc {gcc}", "mode pwm"]
 
     # ABM breathes up to the PWM value, so PWM is the peak brightness per channel.
@@ -119,9 +151,16 @@ def build(panels, k_code, gcc, dx, dy, peak, colors=None):
     cmds.append("mode abm")
     # Each define re-commits (B_EN toggle), restarting all slots from their start phase,
     # so the last one leaves all three running in step.
-    cmds.append(f"define abm 1 {t13} 0 {t13} {t4} start 1")   # delay 0
-    cmds.append(f"define abm 2 {t13} 0 {t13} {t4} start 4")   # delay k
-    cmds.append(f"define abm 3 {t13} 0 {t13} {t4} start 3")   # delay 2k
+    for n, start in enumerate(starts, 1):
+        cmds.append(f"define abm {n} {t1} {t2} {t3} {t4} start {start}")   # slot n lags slot 1 by (n-1)/3 period
+    return cmds
+
+
+def build_pwm(gcc, direction, colors, width, wave_speed, sharp):
+    """Commands for the firmware's own PWM wave (smooth, any RGB colour): the Teensy animates, we only send a few
+    parameters. The firmware clamps odd values and never errors, so this doesn't validate them either."""
+    cmds = [f"gcc {gcc}", "wave " + " ".join(colors or ["ffffff"]) +
+            f" width {width:g} speed {wave_speed:g} dir {direction} sharp {sharp}"]
     return cmds
 
 
@@ -150,10 +189,19 @@ def main():
     ap.add_argument("--peak", default="ff30a0",
                     help="RRGGBB peak brightness per channel (default ff30a0: the green LEDs are much "
                          "brighter than red, so G is held back to make yellow/orange/violet readable)")
+    ap.add_argument("--shape", choices=SHAPES, default="pulse",
+                    help="breath profile of the slots (default pulse); see SHAPES in the source")
     ap.add_argument("--colors", help="colour wave instead of a rainbow: names or RRGGBB, comma separated (red green blue yellow "
                                      "cyan magenta white; other values snap to the nearest), tiled over the LEDs "
                                      "(X first), each LED fading to black; shorter/longer than the display "
                                      "is fine (repeats/truncates)")
+    ap.add_argument("--pwm", action="store_true",
+                    help="smooth wave generated by the firmware in PWM instead of ABM: any RGB colour, any width "
+                         "(--colors, --direction, --width, --wave-speed, --sharp, --gcc apply; the ABM-only "
+                         "options --speed/--shape/--peak/--dx/--dy are ignored)")
+    ap.add_argument("--width", type=float, default=8, help="--pwm: wavelength in LEDs (default 8)")
+    ap.add_argument("--wave-speed", type=float, default=4, help="--pwm: LEDs per second (default 4; negative = reverse)")
+    ap.add_argument("--sharp", type=int, default=1, help="--pwm: 1-8, higher = narrower bright core (default 1)")
     ap.add_argument("--port", default="COM4", help="Windows COM port (default COM4)")
     ap.add_argument("--send", action="store_true", help="send to the board instead of printing")
     ap.add_argument("--stop", action="store_true", help="just reset the board")
@@ -162,8 +210,16 @@ def main():
     dx, dy = DIRECTIONS[a.direction]
     dx = dx if a.dx is None else a.dx
     dy = dy if a.dy is None else a.dy
+    if a.pwm and not a.stop:
+        cmds = [f"panel {a.panels}"] + build_pwm(a.gcc, a.direction,
+                                                 parse_colors(a.colors, snap=False) if a.colors else [],
+                                                 a.width, a.wave_speed, a.sharp)
+        if a.send:
+            sys.exit(send(cmds, a.port))
+        print("\n".join(cmds))
+        return
     cmds = ["reset"] if a.stop else build(a.panels, a.speed, a.gcc, dx, dy, a.peak,
-                                         parse_colors(a.colors) if a.colors is not None else None)
+                                         parse_colors(a.colors) if a.colors is not None else None, a.shape)
     if a.send:
         sys.exit(send(cmds, a.port))
     print("\n".join(cmds))

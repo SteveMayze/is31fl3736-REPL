@@ -16,8 +16,8 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
                                           then upward through all panels, see Panel layout);
                                           a non-zero channel also turns that dot on
 * load abm mR mG mB mR mG mB ...        -> one mode per colour channel, LED 0 upward
-                                          (0 = PWM, 1-3 = ABM-1..3). ABM dots breathe up to their PWM
-                                          value, so `load pwm` them first
+                                          (0 = PWM, 1-3 = ABM-1..3). An ABM dot always breathes 0 -> full
+                                          intensity; its PWM value does not scale the peak
 * fill pwm from <led> to <led> with RRGGBB ...   -> repeat the pattern over LEDs, truncated at the end
 * fill abm from <led> to <led> with m m m ...    -> repeat a per-channel mode pattern
 * assign abm <n 0-3> <dot...>           -> assign by explicit dot index (panel*96 + dot)
@@ -28,6 +28,11 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
                                           (default 0 = endless)
 * gcc <0-255>                           -> Global Current Control
 * reset                                 -> IC reset and re-init
+* wave <RRGGBB ...> [width <leds>] [speed <leds/s>] [dir <d>] [sharp <1-8>] [fps <5-60>]
+                                        -> smooth travelling wave generated on the Teensy in PWM (see "Wave modes").
+                                          Colours tile over the LEDs in display order; `<d>` is right, left, up, down,
+                                          bl-tr, br-tl, tl-br or tr-bl. Never an error: bad values use defaults or are
+                                          clamped. `wave off`, or any command that changes the LEDs, stops it
 * dump                                  -> print current shadow state
 
 # Panel layout and assembly
@@ -52,6 +57,26 @@ This is the reference the firmware, the scripts and the final DMX display should
   master drives SYNC (config SYNC=01) and the slaves take it (SYNC=10), so the ABM timers of all panels
   run together; the firmware sets this when `panel n` is issued.
 
+# Wave modes
+
+Three ways to get a travelling wave, all keeping the REPL available:
+
+| Mode | Command | Colours | Look |
+|------|---------|---------|------|
+| ABM rainbow | `wave.py --send` | crossfades through R, G, B | steps of 3 LEDs (only 3 breath timers) |
+| ABM colour wave | `wave.py --send --colors red,blue` | 7 on/off colours | each LED fades colour <-> black, still 3 phases |
+| PWM wave | `wave.py --send --pwm --colors ff8000` or `wave ...` in the REPL | any RGB | smooth bump of any width |
+
+ABM runs on the chip by itself, so a DMX controller would only set a few values. Its limits come from the
+chip: three timers means three phases along the travel direction, and a dot can only fade between off and
+full. A smooth `..ooO0Ooo..` bump needs many brightness levels at once, so the PWM wave is computed by the
+firmware instead: `waveTick()` in `loop()` renders a frame (default 30 fps), applies a gamma table
+(`GAMMA_EXP`, 2.2) and writes only the PWM rows that changed. Under DMX the controller still only needs to
+supply a handful of values (colours, width, speed, direction), not 288 channels. A full redraw of 3 panels took
+about 7 ms (up to ~19 ms in the worst case measured), so 30 fps has plenty of headroom; `dump` shows the
+frame count and last frame time while a wave runs. Starting a wave sets PWM mode and clears all ABM
+assignments; `wave off`, `reset`, `panel`, `mode`, `load`, `fill`, `assign` and `define` stop it first.
+
 # Scripts (`scripts/`)
 
 * `send.ps1` - sends REPL commands (stdin or `-File`) to a COM port through .NET's `SerialPort` and
@@ -62,6 +87,11 @@ This is the reference the firmware, the scripts and the final DMX display should
   different phases (T1, T4, T3 = delays 0, k, 2k). Only three timers exist, so it repeats every 3 LEDs.
   * **Rainbow (default):** each LED maps R, G, B to a rotation of the slots, so the colours crossfade
     through the primaries as the wave travels.
+  * **PWM wave (`--pwm`):** the firmware animates it (see "Wave modes"); the script only sends a `wave`
+    command. `--colors` takes names or any RRGGBB (no snapping), `--width` (LEDs, default 8), `--wave-speed`
+    (LEDs/s, default 4, negative reverses), `--sharp 1-8` (narrower bright core), `--direction` and `--gcc`
+    apply. The ABM-only `--speed/--shape/--peak/--dx/--dy` are ignored. Example:
+    `python3 scripts/wave.py --send --pwm --colors red --direction up --width 10`.
   * **Colour wave (`--colors`):** each LED uses one slot for all of its lit channels, so it fades from
     black up to its colour and back to black. ABM dots always breathe to full intensity (measured: the PWM
     register does not scale the peak, and an ABM dot at PWM 0 still lights), so a channel is on or off and
@@ -83,7 +113,9 @@ This is the reference the firmware, the scripts and the final DMX display should
   Options: `--panels`, `--speed 0-6` (step time 0.21*2^n s), `--gcc`, `--direction right|left|up|down|bl-tr|br-tl|tl-br|tr-bl` (default `right`; `up`/`down` animate by rows,
   the corner pairs sweep diagonally, e.g. `bl-tr` = bottom-left to top-right,
   `left`/`right` by columns; `--dx/--dy` override the underlying phase steps),
-  `--colors NAME|RRGGBB,...` (colour wave, see above), `--peak RRGGBB` (rainbow only: per-channel
+  `--shape pulse|notch|saw-a|saw-b` (ABM breath profile: how the 3 slots' fade is shaped; `pulse` is the
+  original rainbow timing; none of them can make the wave truly smooth),
+  `--pwm --width --wave-speed --sharp` (PWM wave), `--colors NAME|RRGGBB,...` (colour wave, see above), `--peak RRGGBB` (rainbow only: per-channel
   peak, default `ff30a0`; note the measurement above, so this may have little effect), `--port`.
 * `capture.py`, `montage.py` - optional webcam checking (frames and contact sheets into `captures/`,
   which is git-ignored). Run with a Windows venv with OpenCV:
