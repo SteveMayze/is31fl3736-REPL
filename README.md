@@ -57,22 +57,34 @@ This is the reference the firmware, the scripts and the final DMX display should
 * `send.ps1` - sends REPL commands (stdin or `-File`) to a COM port through .NET's `SerialPort` and
   prints the replies. WSL2 can't see Windows COM ports, so scripts run from WSL call this through
   `powershell.exe`.
-* `rainbow.py` - moving rainbow using Auto Breath Mode. All three ABM slots run the same triangle
-  wave (T1=k, T2=0, T3=k, T4=k) but start at different phases (T1, T4, T3 = delays 0, k, 2k). Each LED
-  maps R, G, B to a rotation of the slots, so the rainbow travels across the panels. Only three
-  timers exist, so it repeats every 3 LEDs and is limited to primary crossfades.
+* `wave.py` (was `rainbow.py`) - travelling wave using Auto Breath Mode, either a rainbow or a
+  single-colour wave. All three ABM slots run the same triangle wave (T1=k, T2=0, T3=k, T4=k) but start at
+  different phases (T1, T4, T3 = delays 0, k, 2k). Only three timers exist, so it repeats every 3 LEDs.
+  * **Rainbow (default):** each LED maps R, G, B to a rotation of the slots, so the colours crossfade
+    through the primaries as the wave travels.
+  * **Colour wave (`--colors`):** each LED uses one slot for all of its lit channels, so it fades from
+    black up to its colour and back to black. ABM dots always breathe to full intensity (measured: the PWM
+    register does not scale the peak, and an ABM dot at PWM 0 still lights), so a channel is on or off and
+    the available colours are red, green, blue, yellow, cyan, magenta and white (black = off). Give names or
+    RRGGBB values; any other RRGGBB snaps to the nearest of those (each channel on if >= 0x80). Brightness
+    is set with `--gcc`. The pattern is tiled over the LEDs, X first then upward (like `fill pwm`): a short
+    pattern repeats and a long one is truncated. **A pattern that doesn't match the number of LEDs is not an
+    error, and neither is an unrecognised colour (it shows black and prints a warning),** because a DMX
+    device has nobody to report errors to.
 
-      python3 scripts/rainbow.py --send          # run on COM4 (omit --send to print the commands)
-      python3 scripts/rainbow.py --send --direction down            # animate by rows, top to bottom
-      python3 scripts/rainbow.py --send --speed 2 --direction up    # faster, bottom to top
-      python3 scripts/rainbow.py --send --direction bl-tr           # diagonal, bottom-left to top-right
-      python3 scripts/rainbow.py --stop --send   # reset the board
+      python3 scripts/wave.py --send          # rainbow on COM4 (omit --send to print the commands)
+      python3 scripts/wave.py --send --direction down            # animate by rows, top to bottom
+      python3 scripts/wave.py --send --speed 2 --direction up    # faster, bottom to top
+      python3 scripts/wave.py --send --direction bl-tr           # diagonal, bottom-left to top-right
+      python3 scripts/wave.py --send --colors red                # red wave fading to black
+      python3 scripts/wave.py --send --colors red,blue --direction up   # alternating columns, rising
+      python3 scripts/wave.py --stop --send   # reset the board
 
   Options: `--panels`, `--speed 0-6` (step time 0.21*2^n s), `--gcc`, `--direction right|left|up|down|bl-tr|br-tl|tl-br|tr-bl` (default `right`; `up`/`down` animate by rows,
   the corner pairs sweep diagonally, e.g. `bl-tr` = bottom-left to top-right,
   `left`/`right` by columns; `--dx/--dy` override the underlying phase steps),
-  `--peak RRGGBB` (per-channel peak, default `ff30a0`: green LEDs are much brighter than red, so G is
-  held back to keep yellow/orange/violet readable), `--port`.
+  `--colors NAME|RRGGBB,...` (colour wave, see above), `--peak RRGGBB` (rainbow only: per-channel
+  peak, default `ff30a0`; note the measurement above, so this may have little effect), `--port`.
 * `capture.py`, `montage.py` - optional webcam checking (frames and contact sheets into `captures/`,
   which is git-ignored). Run with a Windows venv with OpenCV:
 
@@ -82,3 +94,5 @@ This is the reference the firmware, the scripts and the final DMX display should
   Camera indices shift across reboots; use `--name C920` (or `--list`) instead of `--index`
   (needs `pip install pygrabber`). Close other apps using the camera first. Very short exposures catch the multiplexing scan and show
   partial rows; lower `gcc` instead if the LEDs clip to white.
+  With the diffusers on, `--exposure -7 --gain 0` shows static LEDs well (-6 washes out, -9 is black); use
+  about -9 to -11 for ABM waves at `--gcc` 30-255.

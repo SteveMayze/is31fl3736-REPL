@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Moving rainbow for the IS31FL3736 REPL using Auto Breath Mode.
+"""Moving rainbow or single-colour wave for the IS31FL3736 REPL using Auto Breath Mode.
 
 How it works
 ------------
@@ -26,13 +26,27 @@ y = led // 8 here. This needs firmware with that mapping (see README, "Panel lay
 Only three timing slots exist, so the pattern repeats every 3 LEDs along the
 travel direction.
 
+Colour waves (--colors)
+-----------------------
+Each LED gets ONE slot for all of its lit channels (instead of a rotation), so it fades from black up to
+its colour and back down, and the three slots make that a wave travelling in the same direction.
+An ABM dot always breathes to full intensity (measured: its PWM register does not scale the peak, and
+an ABM dot at PWM 0 still lights), so a channel is either on or off and only these colours exist:
+red, green, blue, yellow, cyan, magenta, white (and black = off). Colours are given as names or RRGGBB;
+any RRGGBB is snapped to the nearest of those (each channel on if >= 0x80), which is never an error.
+Brightness is set with --gcc.
+The pattern is tiled over the LEDs, X first then upward, like the firmware's 'fill pwm': a pattern
+shorter than the display repeats and a longer one is truncated. An unrecognised entry is shown as black
+with a warning, never a failure (a DMX device has nobody to report errors to).
+
 Usage
 -----
-    rainbow.py                  print the REPL commands
-    rainbow.py --send           send them to COM4 (through powershell.exe, WSL)
-    rainbow.py --stop --send    reset the board / blank the LEDs
+    wave.py                     print the REPL commands (rainbow)
+    wave.py --send              send them to COM4 (through powershell.exe, WSL)
+    wave.py --colors red,blue --send        colour wave: red/blue tiles fading to black
+    wave.py --stop --send       reset the board / blank the LEDs
 
-Works from WSL or from native Windows (python rainbow.py --send); either way it talks to the port
+Works from WSL or from native Windows (python wave.py --send); either way it talks to the port
 through powershell.exe and send.ps1. Close any serial monitor (VS Code/PlatformIO, PuTTY, Arduino, ...)
 first: COM4 can only be open in one program.
 """
@@ -55,7 +69,25 @@ DIRECTIONS = {
 }
 
 
-def build(panels, k_code, gcc, dx, dy, peak):
+NAMES = {"black": "000000", "red": "ff0000", "green": "00ff00", "blue": "0000ff",
+         "yellow": "ffff00", "cyan": "00ffff", "magenta": "ff00ff", "white": "ffffff"}
+
+
+def parse_colors(text):
+    """Split 'red,00ff00 ...' into on/off RRGGBB tokens (each channel 00 or ff): names or hex, snapped to the
+    nearest of the 8 ABM colours. Anything unrecognised becomes 000000 with a warning, never an error."""
+    out = []
+    for tok in text.replace(",", " ").split():
+        tok = NAMES.get(tok.lower(), tok.lstrip("#"))
+        if len(tok) == 6 and all(c in "0123456789abcdefABCDEF" for c in tok):
+            out.append("".join("ff" if int(tok[i:i + 2], 16) >= 0x80 else "00" for i in (0, 2, 4)))
+        else:
+            print(f"warning: bad colour {tok!r}, using 000000", file=sys.stderr)
+            out.append("000000")
+    return out or ["000000"]
+
+
+def build(panels, k_code, gcc, dx, dy, peak, colors=None):
     if not 0 <= k_code <= 6:
         sys.exit("--speed must be 0..6 (k = 0.21 * 2^n seconds)")
     t13 = k_code          # T1 / T3 code -> k seconds
@@ -64,14 +96,24 @@ def build(panels, k_code, gcc, dx, dy, peak):
 
     # ABM breathes up to the PWM value, so PWM is the peak brightness per channel.
     n_leds = panels * LEDS_PER_PANEL
-    cmds.append(f"fill pwm from 0 to {n_leds - 1} with {peak}")
+    if colors:
+        # Colour wave: tile the pattern over the LEDs (repeat if short, truncate if long).
+        tiled = [colors[i % len(colors)] for i in range(n_leds)]
+        cmds.append("load pwm " + " ".join(tiled))
+    else:
+        cmds.append(f"fill pwm from 0 to {n_leds - 1} with {peak}")
 
     modes = []
     for led in range(n_leds):
         x = led % WIDTH
         y = led // WIDTH          # display row, 0 = bottom of the whole stack
         p = (dx * x + dy * y) % 3
-        modes += [1 + (p + c) % 3 for c in range(3)]   # R, G, B
+        if colors:
+            # One slot for each lit channel: fade colour <-> black. A channel at 00 is left on plain PWM
+            # (mode 0): an ABM-assigned dot with PWM 0 does not stay dark on the chip, it lights up.
+            modes += [1 + p if int(tiled[led][2 * c:2 * c + 2], 16) else 0 for c in range(3)]
+        else:
+            modes += [1 + (p + c) % 3 for c in range(3)]   # R, G, B
     cmds.append("load abm " + " ".join(map(str, modes)))
 
     cmds.append("mode abm")
@@ -108,6 +150,10 @@ def main():
     ap.add_argument("--peak", default="ff30a0",
                     help="RRGGBB peak brightness per channel (default ff30a0: the green LEDs are much "
                          "brighter than red, so G is held back to make yellow/orange/violet readable)")
+    ap.add_argument("--colors", help="colour wave instead of a rainbow: names or RRGGBB, comma separated (red green blue yellow "
+                                     "cyan magenta white; other values snap to the nearest), tiled over the LEDs "
+                                     "(X first), each LED fading to black; shorter/longer than the display "
+                                     "is fine (repeats/truncates)")
     ap.add_argument("--port", default="COM4", help="Windows COM port (default COM4)")
     ap.add_argument("--send", action="store_true", help="send to the board instead of printing")
     ap.add_argument("--stop", action="store_true", help="just reset the board")
@@ -116,7 +162,8 @@ def main():
     dx, dy = DIRECTIONS[a.direction]
     dx = dx if a.dx is None else a.dx
     dy = dy if a.dy is None else a.dy
-    cmds = ["reset"] if a.stop else build(a.panels, a.speed, a.gcc, dx, dy, a.peak)
+    cmds = ["reset"] if a.stop else build(a.panels, a.speed, a.gcc, dx, dy, a.peak,
+                                         parse_colors(a.colors) if a.colors is not None else None)
     if a.send:
         sys.exit(send(cmds, a.port))
     print("\n".join(cmds))
