@@ -37,12 +37,18 @@
 //                                             'loop' sets LTA:LTB, the repeat count (0 = endless)
 //   gcc <0-255>                           -> Global Current Control (PG3, 01h), all panels
 //   reset                                 -> trigger IC reset (read PG3, 11h) and re-init
-//   wave <RRGGBB ...> [width <leds>] [plateau <leds>] [gap <leds>] [speed <leds/s>] [dir <d>]
+//   wave <RRGGBB ...|rainbow|rainbow-bump> [width <leds>] [plateau <leds>] [gap <leds>] [speed <leds/s>] [dir <d>]
 //                         [sharp <1-8>] [fps <5-60>]
 //                                         -> smooth travelling wave generated on the Teensy with PWM
 //                                             (not ABM): every LED fades between black and its colour.
 //                                             One bump is 'width' LEDs long (rise + 'plateau' held at
-//                                             full + fall), bumps are 'gap' dark LEDs apart. Colours tile over
+//                                             full + fall), bumps are 'gap' dark LEDs apart. 'rainbow'
+//                                             instead of colours is a continuous scrolling rainbow:
+//                                             hue follows the position along <d>, 'width' LEDs per full
+//                                             red-to-red cycle, no black ('gap' adds dark LEDs between
+//                                             cycles, 'plateau' and 'sharp' are ignored). 'rainbow-bump'
+//                                             paints the spectrum (red -> violet) across each bump
+//                                             instead. Colours tile over
 //                                             the LEDs in display order (short = repeat, long = truncate,
 //                                             bad entry = black). <d> = right left up down bl-tr br-tl tl-br
 //                                             tr-bl. Never an error: bad or missing values fall back to
@@ -447,8 +453,23 @@ static bool parseHexTriplet(const char *s, uint8_t &r, uint8_t &g, uint8_t &b) {
 
 static const float GAMMA_EXP = 2.2f;   // PWM = 255 * (intensity/255)^GAMMA_EXP, so steps look even to the eye
 
+// rainbow-bump: hue runs red -> violet (this fraction of the colour wheel) across one bump, so its two ends
+// differ. rainbow: hue runs round the whole wheel (red -> red) over one width.
+static const float RAINBOW_SPAN = 5.0f / 6.0f;
+// Rainbow colours are mixed directly in PWM values (LED light is proportional to PWM, so a hue ramp is a linear
+// ramp in PWM; gamma would squash the minor channel and leave red/orange dominating the wheel). The green LEDs
+// are much brighter than the red and blue ones, so each channel's PWM at full hue is scaled to this peak, the
+// same calibration the ABM rainbow used (ff30a0), which keeps yellow, cyan and violet balanced.
+static const uint8_t RAINBOW_PEAK[3] = {255, 48, 160};   // R, G, B PWM at full channel
+// How far (as a fraction of the wheel) each primary stays at full strength before it starts to fade, measured
+// either side of its centre; it reaches zero 1/3 of the wheel away. The standard HSV wheel holds each primary
+// for 1/6 either side (a 1/3-wide plateau, which makes red look stuck because it also leads into both
+// neighbours); a shorter plateau gives the colours between the primaries room, so each hue lasts about equally.
+static const float RAINBOW_PLATEAU = 1.0f / 9.0f;
+
 struct WaveState {
   bool active = false;
+  uint8_t rainbow = 0;                      // 0 = colour pattern, 1 = continuous rainbow, 2 = rainbow in the bump
   uint8_t r[MAX_PANELS * LEDS_PER_PANEL];   // per-LED colour, the pattern already tiled
   uint8_t g[MAX_PANELS * LEDS_PER_PANEL];
   uint8_t b[MAX_PANELS * LEDS_PER_PANEL];
@@ -465,6 +486,21 @@ struct WaveState {
 static WaveState g_wave;
 static uint8_t g_edge[256];                 // raised-cosine rise 0..255 (the fall is its mirror)
 static uint8_t g_gamma[256];                // linear intensity -> PWM
+static uint8_t g_hue[256][3];               // position in the bump (0..255) -> red..violet R,G,B PWM
+static uint8_t g_wheel[256][3];             // position in the cycle (0..255) -> full-wheel R,G,B PWM
+
+// Hue (0..1 round the whole wheel) -> R,G,B PWM values scaled to RAINBOW_PEAK. Red is centred on 0, green on
+// 1/3 and blue on 2/3; each is full within RAINBOW_PLATEAU of its centre and fades linearly to 0 at 1/3.
+static void hueToRgb(float hue, uint8_t out[3]) {
+  const float fade = 1.0f / 3.0f - RAINBOW_PLATEAU;
+  for (uint8_t c = 0; c < 3; c++) {
+    float dh = fabsf(hue - (float)c / 3.0f);
+    if (dh > 0.5f) dh = 1.0f - dh;                           // distance round the wheel
+    float v = (1.0f / 3.0f - dh) / fade;
+    v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    out[c] = (uint8_t)(v * (float)RAINBOW_PEAK[c] + 0.5f);
+  }
+}
 
 static void buildWaveTables(uint8_t sharp) {
   for (uint16_t i = 0; i < 256; i++) {
@@ -473,6 +509,9 @@ static void buildWaveTables(uint8_t sharp) {
     for (uint8_t k = 1; k < sharp; k++) v *= c;
     g_edge[i] = (uint8_t)(v * 255.0f + 0.5f);
     g_gamma[i] = (uint8_t)(powf((float)i / 255.0f, GAMMA_EXP) * 255.0f + 0.5f);
+
+    hueToRgb((float)i / 256.0f * RAINBOW_SPAN, g_hue[i]);   // i/256 so a full cycle doesn't hit red twice
+    hueToRgb((float)i / 256.0f, g_wheel[i]);
   }
 }
 
@@ -512,15 +551,31 @@ static void waveRender() {
     float d = ((float)(g_wave.ax * x + g_wave.ay * y) - shift) / period;
     d = (d - floorf(d)) * period;                            // LEDs into this bump, 0 .. period
     uint8_t level = 0;
-    if (d < g_wave.width) {
+    if (g_wave.rainbow == 1) {
+      if (d < g_wave.width) level = 255;                     // continuous rainbow: full brightness, no fade
+    } else if (d < g_wave.width) {
       if (edge < 0.001f)               level = 255;                          // no fade: a hard block
       else if (d < edge)               level = g_edge[(uint8_t)(d / edge * 255.0f)];
       else if (d < edge + g_wave.plateau) level = 255;
       else                             level = g_edge[(uint8_t)((g_wave.width - d) / edge * 255.0f)];
     }
-    setDotPwmShadow(rgbDot(led, 0), g_gamma[(uint16_t)level * g_wave.r[led] / 255]);
-    setDotPwmShadow(rgbDot(led, 1), g_gamma[(uint16_t)level * g_wave.g[led] / 255]);
-    setDotPwmShadow(rgbDot(led, 2), g_gamma[(uint16_t)level * g_wave.b[led] / 255]);
+    uint8_t pr = 0, pg = 0, pb = 0;
+    if (!g_wave.rainbow) {                                   // colour pattern: scale, then gamma
+      pr = g_gamma[(uint16_t)level * g_wave.r[led] / 255];
+      pg = g_gamma[(uint16_t)level * g_wave.g[led] / 255];
+      pb = g_gamma[(uint16_t)level * g_wave.b[led] / 255];
+    } else if (level) {                                      // hue follows the position inside the cycle / bump
+      uint16_t pos = (uint16_t)(d / g_wave.width * 256.0f);
+      if (pos > 255) pos = 255;
+      const uint8_t *h = (g_wave.rainbow == 1) ? g_wheel[pos] : g_hue[pos];
+      uint16_t gl = g_gamma[level];                          // brightness (fade of the bump) in PWM terms
+      pr = (uint8_t)(h[0] * gl / 255);
+      pg = (uint8_t)(h[1] * gl / 255);
+      pb = (uint8_t)(h[2] * gl / 255);
+    }
+    setDotPwmShadow(rgbDot(led, 0), pr);
+    setDotPwmShadow(rgbDot(led, 1), pg);
+    setDotPwmShadow(rgbDot(led, 2), pb);
   }
   for (uint8_t p = 0; p < g_numPanels; p++) flushPwmRows(p, prev[p]);
   g_wave.frames++;
@@ -561,6 +616,12 @@ static bool isWaveKeyword(const char *s) {
          !strcmp(s, "fps") || !strcmp(s, "off");
 }
 
+static bool equalsNoCase(const char *s, const char *word) {
+  for (; *word; s++, word++)
+    if (tolower((unsigned char)*s) != *word) return false;
+  return *s == '\0';
+}
+
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 static void cmdWave(uint16_t argc, char *argv[]) {
@@ -572,7 +633,10 @@ static void cmdWave(uint16_t argc, char *argv[]) {
   // Colours come first; anything that is not a valid RRGGBB is shown as black.
   static uint8_t cr[MAX_TOKENS], cg[MAX_TOKENS], cb[MAX_TOKENS];
   uint16_t nCol = 0, i = 1;
+  uint8_t rainbow = 0;
   for (; i < argc && !isWaveKeyword(argv[i]); i++) {
+    if (equalsNoCase(argv[i], "rainbow"))      { rainbow = 1; continue; }   // wins over any colours given
+    if (equalsNoCase(argv[i], "rainbow-bump")) { rainbow = 2; continue; }
     uint8_t r = 0, g = 0, b = 0;
     if (!parseHexTriplet(argv[i], r, g, b)) r = g = b = 0;
     cr[nCol] = r; cg[nCol] = g; cb[nCol] = b;
@@ -615,13 +679,15 @@ static void cmdWave(uint16_t argc, char *argv[]) {
     g_wave.b[led] = cb[led % nCol];
   }
   if (plateau > width) plateau = width;                       // the hold can't be longer than the bump
+  g_wave.rainbow = rainbow;
   g_wave.width = width; g_wave.plateau = plateau; g_wave.gap = gap; g_wave.speed = speed; g_wave.ax = ax; g_wave.ay = ay;
   g_wave.sharp = sharp; g_wave.frameMs = (uint16_t)(1000 / fps);
   buildWaveTables(sharp);
   if (!g_wave.active) startWave();
   g_wave.startMs = millis();
   Serial.print(F("OK wave "));
-  Serial.print(nCol); Serial.print(F(" colour(s), width ")); Serial.print(width);
+  if (rainbow) Serial.print(rainbow == 1 ? F("rainbow") : F("rainbow-bump")); else { Serial.print(nCol); Serial.print(F(" colour(s)")); }
+  Serial.print(F(", width ")); Serial.print(width);
   Serial.print(F(" plateau ")); Serial.print(plateau); Serial.print(F(" gap ")); Serial.print(gap);
   Serial.print(F(" speed ")); Serial.print(speed); Serial.print(F(" fps ")); Serial.println(fps);
 }
@@ -647,7 +713,7 @@ static void printHelp() {
   Serial.println(F("                                      loop = repeat count, default 0 = endless)"));
   Serial.println(F("  gcc <0-255>"));
   Serial.println(F("  reset"));
-  Serial.println(F("  wave <RRGGBB ...> [width <leds>] [plateau <leds>] [gap <leds>] [speed <leds/s>]"));
+  Serial.println(F("  wave <RRGGBB ...|rainbow|rainbow-bump> [width <leds>] [plateau <leds>] [gap <leds>] [speed <leds/s>]"));
   Serial.println(F("       [dir right|left|up|down|bl-tr|br-tl|tl-br|tr-bl]"));
   Serial.println(F("       [sharp <1-8>] [fps <5-60>]   (smooth PWM wave made on the Teensy; 'wave off' stops it)"));
   Serial.println(F("  dump"));

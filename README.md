@@ -28,9 +28,9 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
                                           (default 0 = endless)
 * gcc <0-255>                           -> Global Current Control
 * reset                                 -> IC reset and re-init
-* wave <RRGGBB ...> [width <leds>] [plateau <leds>] [gap <leds>] [speed <leds/s>] [dir <d>] [sharp <1-8>] [fps <5-60>]
+* wave <RRGGBB ...|rainbow|rainbow-bump> [width <leds>] [plateau <leds>] [gap <leds>] [speed <leds/s>] [dir <d>] [sharp <1-8>] [fps <5-60>]
                                         -> smooth travelling wave generated on the Teensy in PWM (see "Wave modes").
-                                          Colours tile over the LEDs in display order; `<d>` is right, left, up, down,
+                                          `rainbow` instead of colours is a continuous scrolling rainbow and `rainbow-bump` paints the spectrum across each bump (see "Wave modes"). Colours tile over the LEDs in display order; `<d>` is right, left, up, down,
                                           bl-tr, br-tl, tl-br or tr-bl. Never an error: bad values use defaults or are
                                           clamped. `wave off`, or any command that changes the LEDs, stops it
 * dump                                  -> print current shadow state
@@ -66,6 +66,8 @@ Three ways to get a travelling wave, all keeping the REPL available:
 | ABM rainbow | `wave.py --send` | crossfades through R, G, B | steps of 3 LEDs (only 3 breath timers) |
 | ABM colour wave | `wave.py --send --colors red,blue` | 7 on/off colours | each LED fades colour <-> black, still 3 phases |
 | PWM wave | `wave.py --send --pwm --colors ff8000` or `wave ...` in the REPL | any RGB | smooth bump of any width |
+| PWM rainbow | `wave.py --send --pwm --colors rainbow` or `wave rainbow ...` | whole colour wheel, no black | continuous scrolling rainbow, `--width` LEDs per cycle |
+| PWM rainbow bump | `wave.py --send --pwm --colors rainbow-bump` or `wave rainbow-bump ...` | red to violet across each bump | fading rainbow bands with plateau and gaps |
 
 ABM runs on the chip by itself, so a DMX controller would only set a few values. Its limits come from the
 chip: three timers means three phases along the travel direction, and a dot can only fade between off and
@@ -76,6 +78,27 @@ supply a handful of values (colours, width, speed, direction), not 288 channels.
 about 7 ms (up to ~19 ms in the worst case measured), so 30 fps has plenty of headroom; `dump` shows the
 frame count and last frame time while a wave runs. Starting a wave sets PWM mode and clears all ABM
 assignments; `wave off`, `reset`, `panel`, `mode`, `load`, `fill`, `assign` and `define` stop it first.
+
+**PWM rainbow (`rainbow`):** the colour is a hue that depends on the position along `--direction` and scrolls
+with `--speed`, going round the whole colour wheel (red back to red) over `--width` LEDs. It is always at full
+brightness, so nothing fades to black; `--gap` inserts that many dark LEDs between cycles, and `--plateau` and
+`--sharp` are ignored. An LED cycles through all the colours as the rainbow passes over it. Example:
+`python3 scripts/wave.py --send --pwm --colors rainbow --width 12 --speed 3 --direction up`.
+
+**PWM rainbow bump (`rainbow-bump`):** keeps the 0-1-0 bump shape (`width`, `plateau`, `gap`, `sharp` all work
+as for a single colour) and paints the spectrum across it from red to violet (5/6 of the wheel, so the two
+ends differ). Each moving band is a fading rainbow with dark gaps; because the bump fades through its red end,
+that end is dim and only a row or two tall.
+
+Rainbow colours are mixed directly in PWM (LED light is proportional to PWM, so the hue ramps are linear in
+PWM; running them through the gamma curve squashed the minor channel and made red and orange hold far too long).
+The green LEDs are much brighter than the red and blue ones, so each channel's full value is scaled to
+`RAINBOW_PEAK` in `main.cpp` (R 255, G 48, B 160, the same calibration as the ABM rainbow's `ff30a0`); single
+colours are not affected, and gamma still shapes the fade of `rainbow-bump`. The wheel is not the standard HSV
+one: each primary stays at full strength for only 1/9 of the wheel either side of its centre (`RAINBOW_PLATEAU`)
+and fades to nothing a third of the wheel away, so no colour, red in particular, looks stuck.
+A rainbow frame takes about 5-8 ms. `--colors rainbow` or `rainbow-bump` without `--pwm` just runs the normal
+ABM rainbow.
 
 # Scripts (`scripts/`)
 

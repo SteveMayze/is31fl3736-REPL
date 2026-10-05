@@ -45,6 +45,7 @@ Usage
     wave.py --send              send them to COM4 (through powershell.exe, WSL)
     wave.py --colors red,blue --send        colour wave: red/blue tiles fading to black
     wave.py --pwm --colors red --send       smooth PWM wave made by the firmware (any RGB colour)
+    wave.py --pwm --colors rainbow --send   continuous scrolling rainbow in PWM (rainbow-bump: spectrum per bump)
     wave.py --stop --send       reset the board / blank the LEDs
 
 Works from WSL or from native Windows (python wave.py --send); either way it talks to the port
@@ -157,8 +158,8 @@ def build(panels, k_code, gcc, dx, dy, peak, colors=None, shape="pulse"):
 
 
 def build_pwm(gcc, direction, colors, width, plateau, gap, k_code, sharp):
-    """Commands for the firmware's own PWM wave (smooth, any RGB colour): the Teensy animates, we only send a few
-    parameters. --speed uses the same scale as the ABM modes: the wave advances one LED per step time
+    """Commands for the firmware's own PWM wave (smooth, any RGB colour; colors may be ["rainbow"] for a scrolling
+    rainbow or ["rainbow-bump"] for the spectrum across each bump): the Teensy animates, we only send a few parameters. --speed uses the same scale as the ABM modes: the wave advances one LED per step time
     k = 0.21 * 2^k_code seconds (0 = fastest, 6 = slowest). The firmware clamps odd values and never errors."""
     if not 0 <= k_code <= 6:
         sys.exit("--speed must be 0..6 (k = 0.21 * 2^n seconds)")
@@ -197,7 +198,9 @@ def main():
     ap.add_argument("--shape", choices=SHAPES, default="pulse",
                     help="breath profile of the slots (default pulse); see SHAPES in the source")
     ap.add_argument("--colors", help="colour wave instead of a rainbow: names or RRGGBB, comma separated (red green blue yellow "
-                                     "cyan magenta white; other values snap to the nearest), tiled over the LEDs "
+                                     "cyan magenta white; other values snap to the nearest), tiled over the LEDs; "
+                                     "'rainbow' = the rainbow (with --pwm: a continuous scrolling rainbow, --width LEDs "
+                                     "per cycle; 'rainbow-bump' paints the spectrum across each bump instead) "
                                      "(X first), each LED fading to black; shorter/longer than the display "
                                      "is fine (repeats/truncates)")
     ap.add_argument("--pwm", action="store_true",
@@ -218,6 +221,11 @@ def main():
     ignored = [f"--{n}" for n in ("width", "plateau", "gap", "sharp") if getattr(a, n) is not None]
     if ignored and not a.pwm:
         print(f"warning: {', '.join(ignored)} only apply with --pwm; ignored in the ABM modes", file=sys.stderr)
+    # 'rainbow' is a reserved colour name: PWM = spectrum across each bump, ABM = the normal rainbow.
+    words = [t.lower() for t in a.colors.replace(",", " ").split()] if a.colors else []
+    rainbow = "rainbow-bump" if "rainbow-bump" in words else "rainbow" if "rainbow" in words else None
+    if rainbow and not a.pwm:
+        a.colors = None
     a.width = 8 if a.width is None else a.width
     a.plateau = 0 if a.plateau is None else a.plateau
     a.gap = 0 if a.gap is None else a.gap
@@ -228,6 +236,7 @@ def main():
     dy = dy if a.dy is None else a.dy
     if a.pwm and not a.stop:
         cmds = [f"panel {a.panels}"] + build_pwm(a.gcc, a.direction,
+                                                 [rainbow] if rainbow else
                                                  parse_colors(a.colors, snap=False) if a.colors else [],
                                                  a.width, a.plateau, a.gap,
                                                  0 if a.speed is None else a.speed, a.sharp)
