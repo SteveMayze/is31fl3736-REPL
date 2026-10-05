@@ -5,7 +5,7 @@
 //   help
 //   panel [<n 1-3>]                       -> number of panels incl. the master (default 1).
 //                                             Panels stack in Y: 8x4, 8x8 or 8x12 RGB LEDs,
-//                                             with the master on TOP (see MASTER_AT_TOP).
+//                                             with the master at the BOTTOM (see MASTER_AT_TOP).
 //                                             Changing it resets all panels and sets SYNC
 //                                             (master=01, slaves=10) when n > 1
 //   mode pwm                              -> global PWM mode (B_EN=0), all panels
@@ -53,11 +53,11 @@
 // 7-bit addresses for Wire (8-bit write addresses 0xA0/0xA2/0xA4 >> 1).
 static const uint8_t MAX_PANELS = 3;
 
-// Physical assembly: the master (panel 0) is the TOP panel of the stack and the slaves sit below it.
+// Physical assembly: the master (panel 0) is the BOTTOM panel of the stack and the slaves sit above it.
 // LED numbers, however, are display coordinates (LED 0 = bottom-left of the whole display, X first,
-// then upward), so rgbDot() below maps them onto the chips. Set this to false if the master is ever
-// the bottom panel; nothing else needs to change.
-static const bool MASTER_AT_TOP = true;
+// then upward), so rgbDot() below maps them onto the chips. Set this to true if the master is ever
+// the top panel; nothing else needs to change.
+static const bool MASTER_AT_TOP = false;
 
 static const uint8_t PANEL_ADDR[MAX_PANELS] = {
   0x50, // master:  ADDR2=GND, ADDR1=GND -> A4:A3=00, A2:A1=00
@@ -204,8 +204,8 @@ static void splitDot(uint16_t gdot, uint8_t &panel, uint8_t &dot) {
 // Physical RGB LED layout: each panel is 8 LEDs in X (CS1..CS8) x 4 LEDs in Y (SW row groups of 3),
 // panels stacked in Y. LEDs are numbered as display coordinates, X first: LED n is at x = n % 8 and
 // display row n / 8, where row 0 is the BOTTOM row of the whole stack, whichever chip that row is on.
-// The master (panel 0) is the top panel when MASTER_AT_TOP, so the stack's bottom row belongs to the
-// last panel; within a panel, local row 0 (SW1-3) is its bottom row. A channel on CS(x+1) is wired
+// The master (panel 0) is the top panel only when MASTER_AT_TOP; otherwise it is the bottom panel and
+// holds the stack's bottom row; within a panel, local row 0 (SW1-3) is its bottom row. A channel on CS(x+1) is wired
 // B=SW(y'*3+1), G=SW(y'*3+2), R=SW(y'*3+3) (y' = local row), i.e. the panel has R and B in reverse SW
 // order - this is the one place that swap lives.
 static uint16_t rgbDot(uint8_t led, uint8_t channel /*0=R,1=G,2=B*/) {

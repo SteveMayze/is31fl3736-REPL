@@ -8,7 +8,7 @@ Datasheet: `si31fl3736-REPL/doc/IS31FL3736_DS.pdf`.
 # Serial commands:
 * help
 * panel [<n 1-3>]                       -> number of panels incl. the master (default 1); panels stack
-                                          in Y with the master on top (8x4, 8x8 or 8x12 RGB LEDs). Resets all panels and sets
+                                          in Y with the master at the bottom (8x4, 8x8 or 8x12 RGB LEDs). Resets all panels and sets
                                           SYNC (master/slaves) when n > 1
 * mode pwm                              -> global PWM mode (B_EN=0)
 * mode abm                              -> global Auto Breath mode (B_EN=1)
@@ -37,13 +37,13 @@ This is the reference the firmware, the scripts and the final DMX display should
 * **Panel:** 8 x 4 RGB LEDs on one IS31FL3736 (12 SW rows x 8 CS columns; each LED row is three SW rows,
   SW1-3 = the bottom row). Schematic: `si31fl3736-REPL/doc/DMX-LED-Panel-Schematic.pdf`.
 * **Stack:** panels stack in Y into a display 8 LEDs wide and 4 LEDs tall per panel (8x8 for the 2-panel
-  final display, 8x12 for the 3-panel proof of concept). **The master (panel 0) is the TOP panel;** the
-  slaves sit below it.
+  final display, 8x12 for the 3-panel proof of concept). **The master (panel 0, 0x50) is the BOTTOM panel;** the
+  slaves sit above it (panel 1 at the bottom, nearest the webcam).
 * **Numbering:** LEDs are display coordinates. LED 0 is the bottom-left of the whole display, X runs
   left to right, then rows run bottom to top through all panels, whichever chip they are on. So LED n is
   at x = n % 8, row n / 8, and `load`/`fill`/DMX all use this. (`assign abm` and `dump` use raw chip dot
   indices, panel*96 + dot.) `MASTER_AT_TOP` in `main.cpp` holds the one assumption about the stack; set it
-  to `false` if the master is ever the bottom panel and nothing else changes.
+  to `true` if the master is ever the top panel and nothing else changes.
 * **Addresses:** each board's I2C address is set by its ADDR1/ADDR2 solder jumpers (JP1-JP8), not by its
   place on the ribbon: master 0x50 (ADDR1=GND, ADDR2=GND), panel 1 0x51 (ADDR1=SCL), panel 2 0x52
   (ADDR1=SDA).
